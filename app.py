@@ -677,9 +677,19 @@ def fetch_20d_daily_history(
 # ==========================================================
 def _fetch_today_5m_candles(
     key,
-    access_token,
-    date_str
+    access_token
 ):
+    """
+    Fetch CURRENT DAY 5-minute candles.
+
+    Important:
+    The previous version used the standard historical-candle
+    endpoint with today's date. For a live ORB, use Upstox V3
+    Intraday Candle API instead. The V3 intraday endpoint is
+    specifically designed to return the current trading day's
+    candles.
+    """
+
     headers = {
         'Accept': 'application/json',
         'Authorization': f'Bearer {access_token}'
@@ -690,101 +700,139 @@ def _fetch_today_5m_candles(
         safe='|:'
     )
 
+    # Upstox V3 current-day intraday endpoint.
+    # 5-minute candles are requested directly.
     url = (
-        f"https://api.upstox.com/v2/historical-candle/"
-        f"{encoded_key}/5minute/{date_str}/{date_str}"
+        f"https://api.upstox.com/v3/historical-candle/"
+        f"intraday/{encoded_key}/minutes/5"
     )
 
-    try:
+    for attempt in range(2):
 
-        res = requests.get(
-            url,
-            headers=headers,
-            timeout=5
-        )
+        try:
 
-        if res.status_code != 200:
-            return key, []
+            res = requests.get(
+                url,
+                headers=headers,
+                timeout=6
+            )
 
-        candles = res.json().get(
-            'data',
-            {}
-        ).get(
-            'candles',
-            []
-        )
+            if res.status_code == 200:
 
-        result = []
+                payload = res.json()
 
-        for candle in candles:
-
-            if len(candle) < 6:
-                continue
-
-            try:
-
-                ts = pd.to_datetime(
-                    candle[0],
-                    errors='coerce'
+                candles = (
+                    payload
+                    .get('data', {})
+                    .get('candles', [])
                 )
 
-                if pd.isna(ts):
-                    continue
+                result = []
 
-                if ts.tzinfo is not None:
-                    ts = ts.tz_convert(IST)
-                else:
-                    ts = ts.tz_localize(IST)
+                for candle in candles:
 
-                result.append({
-                    'timestamp': ts,
-                    'open': safe_float(
-                        candle[1]
-                    ),
-                    'high': safe_float(
-                        candle[2]
-                    ),
-                    'low': safe_float(
-                        candle[3]
-                    ),
-                    'close': safe_float(
-                        candle[4]
-                    ),
-                    'volume': safe_float(
-                        candle[5]
-                    )
-                })
+                    if len(candle) < 6:
+                        continue
 
-            except Exception:
-                continue
+                    try:
 
-        return key, result
+                        ts = pd.to_datetime(
+                            candle[0],
+                            errors='coerce'
+                        )
 
-    except Exception:
-        return key, []
+                        if pd.isna(ts):
+                            continue
+
+                        if ts.tzinfo is not None:
+                            ts = ts.tz_convert(IST)
+                        else:
+                            ts = ts.tz_localize(IST)
+
+                        result.append({
+                            'timestamp': ts,
+                            'open': safe_float(
+                                candle[1]
+                            ),
+                            'high': safe_float(
+                                candle[2]
+                            ),
+                            'low': safe_float(
+                                candle[3]
+                            ),
+                            'close': safe_float(
+                                candle[4]
+                            ),
+                            'volume': safe_float(
+                                candle[5]
+                            )
+                        })
+
+                    except Exception:
+                        continue
+
+                return key, result
+
+            elif res.status_code == 429:
+
+                time.sleep(0.5)
+
+            else:
+
+                # Retry once for transient API failures.
+                if attempt == 0:
+                    time.sleep(0.25)
+
+        except Exception:
+
+            if attempt == 0:
+                time.sleep(0.25)
+
+    return key, []
 
 
 @st.cache_data(
-    ttl=25,
+    ttl=20,
     show_spinner=False
 )
 def fetch_orb_data_for_symbols_cached(
-    symbol_to_key,
+    symbol_to_key_items,
     symbols,
     access_token,
     today_str
 ):
     """
-    Fetch today's 5-minute candles only for stocks that
-    have entered either Top-30 list.
+    Build today's 09:15–09:45 ORB from Upstox V3
+    current-day 5-minute candles.
 
-    ORB = 09:15 through 09:45.
+    ORB range:
+        09:15
+        09:20
+        09:25
+        09:30
+        09:35
+        09:40
+
+    Breakout evaluation starts AFTER 09:45.
+
+    Scoring:
+        +3  ORB breakout
+        +5  ORB breakout + maintained momentum
+        -3  Breakout happened but price returned
+            back inside the ORB range
+         0  Still inside ORB / no breakout
     """
+
+    symbol_to_key = dict(
+        symbol_to_key_items
+    )
 
     results = {}
 
     now = datetime.now(IST)
 
+    # Before the ORB is complete, do not call the
+    # intraday API unnecessarily.
     if (
         now.hour < 9
         or (
@@ -798,17 +846,22 @@ def fetch_orb_data_for_symbols_cached(
             results[symbol] = {
                 'orb_high': 0.0,
                 'orb_low': 0.0,
-                'orb_status': 'WAITING',
+                'orb_status': 'WAITING FOR 09:45',
                 'orb_score': 0
             }
 
         return results
 
-    tasks = []
+    # ------------------------------------------------------
+    # Fetch current-day candles.
+    # ------------------------------------------------------
+    fetched = {}
 
     with ThreadPoolExecutor(
         max_workers=4
     ) as executor:
+
+        future_to_symbol = {}
 
         for symbol in symbols:
 
@@ -818,128 +871,348 @@ def fetch_orb_data_for_symbols_cached(
 
             if key:
 
-                tasks.append(
-                    executor.submit(
-                        _fetch_today_5m_candles,
-                        key,
-                        access_token,
-                        today_str
-                    )
+                future = executor.submit(
+                    _fetch_today_5m_candles,
+                    key,
+                    access_token
                 )
 
-        for future in as_completed(tasks):
+                future_to_symbol[
+                    future
+                ] = symbol
 
-            key, candles = future.result()
+        for future in as_completed(
+            future_to_symbol
+        ):
 
-            symbol = None
-
-            for s, k in symbol_to_key.items():
-
-                if k == key:
-                    symbol = s
-                    break
-
-            if not symbol:
-                continue
-
-            df = pd.DataFrame(candles)
-
-            if df.empty:
-
-                results[symbol] = {
-                    'orb_high': 0.0,
-                    'orb_low': 0.0,
-                    'orb_status': 'NO DATA',
-                    'orb_score': 0
-                }
-
-                continue
-
-            df['timestamp'] = pd.to_datetime(
-                df['timestamp'],
-                errors='coerce'
-            )
-
-            df = df.dropna(
-                subset=['timestamp']
-            )
-
-            if df.empty:
-                continue
-
-            if df['timestamp'].dt.tz is None:
-
-                df['timestamp'] = (
-                    df['timestamp']
-                    .dt.tz_localize(IST)
-                )
-
-            else:
-
-                df['timestamp'] = (
-                    df['timestamp']
-                    .dt.tz_convert(IST)
-                )
-
-            df = df.sort_values(
-                'timestamp'
-            )
-
-            # 09:15, 09:20, 09:25, 09:30,
-            # 09:35 and 09:40 candles.
-            orb_df = df[
-                (df['timestamp'].dt.hour == 9)
-                &
-                (df['timestamp'].dt.minute >= 15)
-                &
-                (df['timestamp'].dt.minute < 45)
+            symbol = future_to_symbol[
+                future
             ]
 
-            if orb_df.empty:
+            try:
 
-                results[symbol] = {
-                    'orb_high': 0.0,
-                    'orb_low': 0.0,
-                    'orb_status': 'WAITING',
-                    'orb_score': 0
-                }
+                key, candles = (
+                    future.result()
+                )
 
-                continue
+                fetched[symbol] = candles
 
-            orb_high = safe_float(
-                orb_df['high'].max()
+            except Exception:
+
+                fetched[symbol] = []
+
+    # ------------------------------------------------------
+    # Calculate ORB independently for each stock.
+    # ------------------------------------------------------
+    for symbol in symbols:
+
+        candles = fetched.get(
+            symbol,
+            []
+        )
+
+        if not candles:
+
+            results[symbol] = {
+                'orb_high': 0.0,
+                'orb_low': 0.0,
+                'orb_status': 'NO DATA',
+                'orb_score': 0
+            }
+
+            continue
+
+        df = pd.DataFrame(
+            candles
+        )
+
+        if df.empty:
+
+            results[symbol] = {
+                'orb_high': 0.0,
+                'orb_low': 0.0,
+                'orb_status': 'NO DATA',
+                'orb_score': 0
+            }
+
+            continue
+
+        df['timestamp'] = pd.to_datetime(
+            df['timestamp'],
+            errors='coerce'
+        )
+
+        df = df.dropna(
+            subset=['timestamp']
+        )
+
+        if df.empty:
+
+            results[symbol] = {
+                'orb_high': 0.0,
+                'orb_low': 0.0,
+                'orb_status': 'NO DATA',
+                'orb_score': 0
+            }
+
+            continue
+
+        if df['timestamp'].dt.tz is None:
+
+            df['timestamp'] = (
+                df['timestamp']
+                .dt.tz_localize(IST)
             )
 
-            orb_low = safe_float(
-                orb_df['low'].min()
+        else:
+
+            df['timestamp'] = (
+                df['timestamp']
+                .dt.tz_convert(IST)
             )
 
-            latest = df.iloc[-1]
+        df = df.sort_values(
+            'timestamp'
+        ).reset_index(
+            drop=True
+        )
 
-            current_price = safe_float(
-                latest['close']
+        # Only today's candles.
+        df = df[
+            df['timestamp'].dt.strftime(
+                "%Y-%m-%d"
+            ) == today_str
+        ].copy()
+
+        if df.empty:
+
+            results[symbol] = {
+                'orb_high': 0.0,
+                'orb_low': 0.0,
+                'orb_status': 'NO TODAY DATA',
+                'orb_score': 0
+            }
+
+            continue
+
+        # --------------------------------------------------
+        # 09:15 through 09:40 = six 5-minute candles.
+        # The 09:45 candle is NOT part of the ORB range.
+        # --------------------------------------------------
+        orb_df = df[
+            (
+                df['timestamp'].dt.hour == 9
+            )
+            &
+            (
+                df['timestamp'].dt.minute >= 15
+            )
+            &
+            (
+                df['timestamp'].dt.minute < 45
+            )
+        ].copy()
+
+        # Require at least one candle. Normally six should
+        # exist after 09:45.
+        if orb_df.empty:
+
+            results[symbol] = {
+                'orb_high': 0.0,
+                'orb_low': 0.0,
+                'orb_status': 'ORB DATA NOT READY',
+                'orb_score': 0
+            }
+
+            continue
+
+        orb_high = safe_float(
+            orb_df['high'].max()
+        )
+
+        orb_low = safe_float(
+            orb_df['low'].min()
+        )
+
+        if (
+            orb_high <= 0
+            or orb_low <= 0
+            or orb_high <= orb_low
+        ):
+
+            results[symbol] = {
+                'orb_high': orb_high,
+                'orb_low': orb_low,
+                'orb_status': 'INVALID ORB',
+                'orb_score': 0
+            }
+
+            continue
+
+        # --------------------------------------------------
+        # Only candles AFTER 09:45 can be breakout candles.
+        # --------------------------------------------------
+        after_orb = df[
+            (
+                df['timestamp'].dt.hour > 9
+            )
+            |
+            (
+                (
+                    df['timestamp'].dt.hour == 9
+                )
+                &
+                (
+                    df['timestamp'].dt.minute >= 45
+                )
+            )
+        ].copy()
+
+        if after_orb.empty:
+
+            results[symbol] = {
+                'orb_high': orb_high,
+                'orb_low': orb_low,
+                'orb_status': 'ORB READY',
+                'orb_score': 0
+            }
+
+            continue
+
+        # --------------------------------------------------
+        # Detect actual breakout events using CLOSE.
+        #
+        # Bull breakout:
+        #   close > ORB high
+        #
+        # Bear breakout:
+        #   close < ORB low
+        # --------------------------------------------------
+        bull_breaks = (
+            after_orb['close']
+            > orb_high
+        )
+
+        bear_breaks = (
+            after_orb['close']
+            < orb_low
+        )
+
+        had_bull_break = bool(
+            bull_breaks.any()
+        )
+
+        had_bear_break = bool(
+            bear_breaks.any()
+        )
+
+        latest_close = safe_float(
+            after_orb.iloc[-1]['close']
+        )
+
+        # --------------------------------------------------
+        # If both sides broke at different times, evaluate
+        # the most recent breakout direction.
+        # --------------------------------------------------
+        latest_bull_time = (
+            after_orb.loc[
+                bull_breaks,
+                'timestamp'
+            ].max()
+            if had_bull_break
+            else None
+        )
+
+        latest_bear_time = (
+            after_orb.loc[
+                bear_breaks,
+                'timestamp'
+            ].max()
+            if had_bear_break
+            else None
+        )
+
+        if (
+            latest_bull_time is not None
+            and latest_bear_time is not None
+        ):
+
+            if latest_bull_time > latest_bear_time:
+                last_break_direction = (
+                    'BULLISH'
+                )
+                last_break_time = (
+                    latest_bull_time
+                )
+            else:
+                last_break_direction = (
+                    'BEARISH'
+                )
+                last_break_time = (
+                    latest_bear_time
+                )
+
+        elif latest_bull_time is not None:
+
+            last_break_direction = (
+                'BULLISH'
+            )
+            last_break_time = (
+                latest_bull_time
             )
 
-            # After ORB:
-            # Above ORB high = bullish breakout.
-            # Below ORB low = bearish breakout.
-            # Inside range after a breakout = negative.
-            if current_price > orb_high:
+        elif latest_bear_time is not None:
 
-                recent_df = df[
-                    df['timestamp'] >= (
-                        df['timestamp'].max()
-                        - pd.Timedelta(
-                            minutes=15
-                        )
-                    )
-                ]
+            last_break_direction = (
+                'BEARISH'
+            )
+            last_break_time = (
+                latest_bear_time
+            )
 
-                maintained = (
-                    not recent_df.empty
-                    and
-                    recent_df['close'].min()
-                    > orb_high
+        else:
+
+            last_break_direction = None
+            last_break_time = None
+
+        # --------------------------------------------------
+        # No breakout yet.
+        # --------------------------------------------------
+        if last_break_direction is None:
+
+            results[symbol] = {
+                'orb_high': orb_high,
+                'orb_low': orb_low,
+                'orb_status': 'INSIDE ORB',
+                'orb_score': 0
+            }
+
+            continue
+
+        # Candles from the latest breakout onward.
+        post_break = after_orb[
+            after_orb['timestamp']
+            >= last_break_time
+        ].copy()
+
+        if post_break.empty:
+            post_break = after_orb.tail(1)
+
+        # --------------------------------------------------
+        # Bullish breakout.
+        # --------------------------------------------------
+        if last_break_direction == 'BULLISH':
+
+            if latest_close > orb_high:
+
+                # Every candle after the latest breakout
+                # must remain above ORB high for the
+                # stronger momentum score.
+                maintained = bool(
+                    (
+                        post_break['close']
+                        > orb_high
+                    ).all()
                 )
 
                 if maintained:
@@ -947,7 +1220,6 @@ def fetch_orb_data_for_symbols_cached(
                     status = (
                         'BULL ORB + MOMENTUM'
                     )
-
                     score = 5
 
                 else:
@@ -955,25 +1227,32 @@ def fetch_orb_data_for_symbols_cached(
                     status = (
                         'BULL ORB BREAK'
                     )
-
                     score = 3
 
-            elif current_price < orb_low:
+            else:
 
-                recent_df = df[
-                    df['timestamp'] >= (
-                        df['timestamp'].max()
-                        - pd.Timedelta(
-                            minutes=15
-                        )
-                    )
-                ]
+                # It broke above ORB and subsequently
+                # returned inside/below the ORB.
+                status = (
+                    'BULL ORB RETURN / NEGATIVE'
+                )
+                score = -3
 
-                maintained = (
-                    not recent_df.empty
-                    and
-                    recent_df['close'].max()
-                    < orb_low
+        # --------------------------------------------------
+        # Bearish breakout.
+        # --------------------------------------------------
+        else:
+
+            if latest_close < orb_low:
+
+                # Every candle after the latest breakout
+                # must remain below ORB low for the
+                # stronger momentum score.
+                maintained = bool(
+                    (
+                        post_break['close']
+                        < orb_low
+                    ).all()
                 )
 
                 if maintained:
@@ -981,7 +1260,6 @@ def fetch_orb_data_for_symbols_cached(
                     status = (
                         'BEAR ORB + MOMENTUM'
                     )
-
                     score = 5
 
                 else:
@@ -989,53 +1267,29 @@ def fetch_orb_data_for_symbols_cached(
                     status = (
                         'BEAR ORB BREAK'
                     )
-
                     score = 3
 
             else:
 
-                had_bull_break = (
-                    df['close'] > orb_high
-                ).any()
+                # It broke below ORB and subsequently
+                # returned inside/above the ORB.
+                status = (
+                    'BEAR ORB RETURN / NEGATIVE'
+                )
+                score = -3
 
-                had_bear_break = (
-                    df['close'] < orb_low
-                ).any()
-
-                if (
-                    had_bull_break
-                    or had_bear_break
-                ):
-
-                    status = (
-                        'ORB RETURN / NEGATIVE'
-                    )
-
-                    score = -3
-
-                else:
-
-                    status = 'INSIDE ORB'
-                    score = 0
-
-            results[symbol] = {
-                'orb_high': orb_high,
-                'orb_low': orb_low,
-                'orb_status': status,
-                'orb_score': score
-            }
-
-    for symbol in symbols:
-
-        results.setdefault(
-            symbol,
-            {
-                'orb_high': 0.0,
-                'orb_low': 0.0,
-                'orb_status': 'NO DATA',
-                'orb_score': 0
-            }
-        )
+        results[symbol] = {
+            'orb_high': round(
+                orb_high,
+                2
+            ),
+            'orb_low': round(
+                orb_low,
+                2
+            ),
+            'orb_status': status,
+            'orb_score': score
+        }
 
     return results
 
@@ -2214,8 +2468,8 @@ def dashboard_live_loop():
     # ==========================================
     orb_data = (
         fetch_orb_data_for_symbols_cached(
-            symbol_to_key,
-            retained_symbols,
+            tuple(sorted(symbol_to_key.items())),
+            tuple(sorted(retained_symbols)),
             ACCESS_TOKEN,
             today_str
         )
