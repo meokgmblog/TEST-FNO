@@ -12,7 +12,7 @@ import streamlit as st
 # PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(
-    page_title="F&O Institutional Sector Radar",
+    page_title="F&O Institutional Sector & Money Flow Radar",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -36,7 +36,6 @@ if not os.path.exists(FNO_EXCEL_PATH) or not os.path.exists(INSTRUMENTS_CSV_PATH
 # FORMATTING HELPERS
 # ==========================================
 def format_volume(vol):
-    """Formats raw volume into standard K/M units."""
     if vol >= 1_000_000:
         return f"{vol / 1_000_000:.2f}M"
     elif vol >= 1_000:
@@ -44,8 +43,16 @@ def format_volume(vol):
     return str(int(vol))
 
 def format_signed_pct(val):
-    """Formats percentage with explicit + / - signs."""
     return f"+{val:.2f}%" if val > 0 else f"{val:.2f}%"
+
+def format_money(val_cr):
+    """Formats institutional cash flow into Crores (₹)."""
+    if abs(val_cr) >= 100:
+        return f"₹{val_cr:+,.1f} Cr"
+    elif abs(val_cr) >= 1:
+        return f"₹{val_cr:+,.2f} Cr"
+    else:
+        return f"₹{val_cr * 100:+,.1f} Lakhs"
 
 # ==========================================
 # 1. DATA LOADING & RATE-LIMITED FETCHING
@@ -103,7 +110,6 @@ def fetch_10d_avg_volumes_throttled(instrument_keys, access_token):
 
 @st.cache_data(ttl=3600)
 def fetch_historical_candles_20d(instrument_keys, access_token):
-    """Fetches 20 days of historical daily info for high/low scoring."""
     today = datetime.now(IST)
     from_date = (today - timedelta(days=35)).strftime("%Y-%m-%d")
     to_date = today.strftime("%Y-%m-%d")
@@ -134,7 +140,6 @@ def fetch_historical_candles_20d(instrument_keys, access_token):
 
 @st.cache_data(ttl=300)
 def fetch_intraday_candles_today(instrument_keys, access_token):
-    """Fetches 5-minute intraday candles for today to compute 09:45 ORB levels."""
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     intraday_data = {}
     def fetch_intra(key):
@@ -244,15 +249,28 @@ def process_market_data(mapped_df, quotes_dict, avg_10d_vol_dict):
         
         buy_qty = float(quote.get('total_buy_quantity') or 0)
         sell_qty = float(quote.get('total_sell_quantity') or 0)
+        total_qty_sum = buy_qty + sell_qty
+        
+        # Professional Bounded Order Flow Ratio (capped between 0.1x and 10.0x to eliminate wild outliers)
+        if total_qty_sum > 0:
+            raw_flow = (buy_qty / total_qty_sum) * 2.0
+            flow_ratio = max(0.1, min(10.0, raw_flow if buy_qty > sell_qty else (2.0 - (sell_qty / total_qty_sum) * 2.0)))
+        else:
+            flow_ratio = 1.0
+
+        # Institutional Net Money Inflow/Outflow in Crores (₹ Cr) = Turnover * (Buy Qty - Sell Qty) / Total Qty
+        turnover_cr = (ltp * volume) / 10.0**7
+        if total_qty_sum > 0:
+            net_money_flow_cr = turnover_cr * ((buy_qty - sell_qty) / total_qty_sum)
+        else:
+            net_money_flow_cr = turnover_cr * (1.0 if p_change > 0 else -1.0) if volume > 0 else 0.0
         
         avg_vol = avg_10d_vol_dict.get(key, 0.0) or avg_10d_vol_dict.get(symbol, 0.0)
         vol_ratio = (volume / avg_vol) if avg_vol > 0 else 1.0
         vol_ratio_capped = min(vol_ratio, 10.0)
         
         vwap_dist = ((ltp - vwap) / vwap * 100) if vwap > 0 else 0.0
-        flow_ratio = (buy_qty / sell_qty) if sell_qty > 0 else (1.5 if buy_qty > 0 else 1.0)
-        
-        inst_score = p_change + (vwap_dist * 0.8) + ((flow_ratio - 1) * 2) + ((vol_ratio_capped - 1) * 0.5)
+        inst_score = p_change + (vwap_dist * 0.8) + (net_money_flow_cr * 0.1) + ((vol_ratio_capped - 1) * 0.5)
 
         tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}&interval=5"
 
@@ -271,6 +289,8 @@ def process_market_data(mapped_df, quotes_dict, avg_10d_vol_dict):
             'Vol / 10D Vol': f"{vol_ratio:.2f}x",
             'FLOW_RATIO_RAW': round(flow_ratio, 2),
             'Order Flow': f"{flow_ratio:.2f}x",
+            'NET_MONEY_FLOW_CR': net_money_flow_cr,
+            'Net Money Flow': format_money(net_money_flow_cr),
             'INST_SCORE': round(inst_score, 2),
         })
     return pd.DataFrame(records)
@@ -289,7 +309,7 @@ def is_market_open():
 # ==========================================
 # 3. STREAMLIT RENDER LOGIC
 # ==========================================
-st.title("⚡F&O Institutional Sector Radar")
+st.title("⚡F&O Institutional Sector & Money Flow Radar")
 
 with st.spinner("Initializing Market Mapping & Historical Volumes..."):
     mapped_df = load_instrument_mapping(FNO_EXCEL_PATH, INSTRUMENTS_CSV_PATH)
@@ -304,7 +324,6 @@ def dashboard_live_loop():
     now_str = now.strftime("%H:%M:%S IST")
     today_str = now.strftime("%Y-%m-%d")
 
-    # Reset cache if a new trading day starts
     if 'frozen_date' in st.session_state and st.session_state['frozen_date'] != today_str:
         st.session_state.pop('frozen_df', None)
         st.session_state.pop('frozen_time', None)
@@ -342,32 +361,32 @@ def dashboard_live_loop():
         return
 
     # --- Sector Summary Table ---
-    st.subheader("Sector Performance Breakdown")
+    st.subheader("Sector Performance & Institutional Net Inflow Breakdown")
     sector_stats = []
     for sector, group in data_df.groupby('SECTOR'):
         avg_chg = group['CHANGE_%'].mean()
+        total_inflow = group['NET_MONEY_FLOW_CR'].sum()
         advances = (group['CHANGE_%'] > 0).sum()
         declines = (group['CHANGE_%'] < 0).sum()
         total_stocks = len(group)
         breadth_ratio = (advances - declines) / total_stocks if total_stocks > 0 else 0.0
         top_stock = group.loc[group['INST_SCORE'].idxmax()]['SYMBOL'] if not group.empty else "N/A"
-        sector_score = avg_chg + (0.75 * breadth_ratio)
+        sector_score = avg_chg + (0.75 * breadth_ratio) + (total_inflow * 0.01)
         
         sector_stats.append({
             "Sector": sector,
             "Avg Change %": format_signed_pct(avg_chg),
+            "Net Money Flow": format_money(total_inflow),
             "Adv/Dec": f"{advances}/{declines}",
             "Breadth Ratio": f"{breadth_ratio:+.2f}",
-            "Avg Order Flow": f"{group['FLOW_RATIO_RAW'].mean():.2f}x",
             "Top Stock": top_stock,
-            "Sector Momentum": "BULLISH" if sector_score > 0.3 else ("BEARISH" if sector_score < -0.3 else "NEUTRAL"),
-            "_SORT_CHG": avg_chg
+            "Sector Sentiment": "BULLISH" if sector_score > 0.3 else ("BEARISH" if sector_score < -0.3 else "NEUTRAL"),
+            "_SORT_INFLOW": total_inflow
         })
     
-    sector_df = pd.DataFrame(sector_stats).sort_values(by="_SORT_CHG", ascending=False).drop(columns=['_SORT_CHG'])
+    sector_df = pd.DataFrame(sector_stats).sort_values(by="_SORT_INFLOW", ascending=False).drop(columns=['_SORT_INFLOW'])
     st.dataframe(sector_df, use_container_width=True, hide_index=True)
 
-    # --- Table Config for Interactive TradingView Chart Hyperlinks ---
     table_column_config = {
         "CHART_URL": st.column_config.LinkColumn(
             "Symbol",
@@ -396,32 +415,32 @@ def dashboard_live_loop():
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader(f"{label_prefix} Bullish Momentum Leaders")
-        bullish = unique_symbols_df.sort_values(by='INST_SCORE', ascending=False)
+        st.subheader(f"{label_prefix} Bullish Institutional Inflow Leaders")
+        bullish = unique_symbols_df.sort_values(by='NET_MONEY_FLOW_CR', ascending=False)
         bullish_display = bullish.head(top_n) if top_n is not None else bullish
         bullish_display = bullish_display.copy()
         bullish_display.rename(columns={'CHANGE_STR': 'Change %', 'VWAP_DIST_STR': 'VWAP Dist %', 'INST_SCORE': 'Inst. Score'}, inplace=True)
-        cols_bullish = ['CHART_URL', 'SECTOR', 'LTP (₹)', 'Change %', 'VWAP Dist %', 'Volume', 'Vol / 10D Vol', 'Order Flow', 'Inst. Score']
+        cols_bullish = ['CHART_URL', 'SECTOR', 'LTP (₹)', 'Change %', 'Net Money Flow', 'VWAP Dist %', 'Volume', 'Vol / 10D Vol', 'Inst. Score']
         st.dataframe(bullish_display[cols_bullish], column_config=table_column_config, use_container_width=True, hide_index=True)
 
     with col2:
-        st.subheader(f"{label_prefix} Bearish Short Setups")
-        bearish = unique_symbols_df.sort_values(by='INST_SCORE', ascending=True)
+        st.subheader(f"{label_prefix} Bearish Institutional Outflow Leaders")
+        bearish = unique_symbols_df.sort_values(by='NET_MONEY_FLOW_CR', ascending=True)
         bearish_display = bearish.head(top_n) if top_n is not None else bearish
         bearish_display = bearish_display.copy()
         bearish_display.rename(columns={'CHANGE_STR': 'Change %', 'VWAP_DIST_STR': 'VWAP Dist %', 'INST_SCORE': 'Inst. Score'}, inplace=True)
-        cols_bearish = ['CHART_URL', 'SECTOR', 'LTP (₹)', 'Change %', 'VWAP Dist %', 'Volume', 'Vol / 10D Vol', 'Order Flow', 'Inst. Score']
+        cols_bearish = ['CHART_URL', 'SECTOR', 'LTP (₹)', 'Change %', 'Net Money Flow', 'VWAP Dist %', 'Volume', 'Vol / 10D Vol', 'Inst. Score']
         st.dataframe(bearish_display[cols_bearish], column_config=table_column_config, use_container_width=True, hide_index=True)
 
     # =========================================================================
-    # 4. CUMULATIVE TOP 30 SESSION TRACKER & ADVANCED MULTI-FACTOR RANKING TABLE
+    # 4. CUMULATIVE TOP 30 INSTITUTIONAL MONEY FLOW & 09:45 ORB LEADERBOARD
     # =========================================================================
     st.markdown("---")
-    st.subheader("🏆 Cumulative Top 30 Multi-Factor Institutional Session Leaderboard")
-    st.caption("Tracks all stocks that entered the top 30 Bullish or Bearish lists since market open. Ranked via 20-day high/low price zones, multi-period volume spikes, and 09:45 ORB break/momentum rules.")
+    st.subheader("🏆 Cumulative Top 30 Institutional Money Flow & 09:45 ORB Leaderboard")
+    st.caption("Ranked via professional institutional net capital turnover (₹ Crores), 20-day high/low breakout zones, multi-period volume expansion, and 09:45 ORB breakouts.")
 
-    curr_top30_bull = set(unique_symbols_df.sort_values(by='INST_SCORE', ascending=False).head(30)['SYMBOL'].tolist())
-    curr_top30_bear = set(unique_symbols_df.sort_values(by='INST_SCORE', ascending=True).head(30)['SYMBOL'].tolist())
+    curr_top30_bull = set(unique_symbols_df.sort_values(by='NET_MONEY_FLOW_CR', ascending=False).head(30)['SYMBOL'].tolist())
+    curr_top30_bear = set(unique_symbols_df.sort_values(by='NET_MONEY_FLOW_CR', ascending=True).head(30)['SYMBOL'].tolist())
     curr_combined_30 = curr_top30_bull.union(curr_top30_bear)
 
     if 'tracked_session_symbols' not in st.session_state:
@@ -445,6 +464,7 @@ def dashboard_live_loop():
             r = row_data.iloc[0]
             ltp = r['LTP (₹)']
             current_vol = r['VOLUME_RAW']
+            net_money_cr = r['NET_MONEY_FLOW_CR']
             instrument_key = mapped_df[mapped_df['SYMBOL'] == sym]['instrument_key'].values
             if len(instrument_key) == 0:
                 continue
@@ -462,12 +482,12 @@ def dashboard_live_loop():
                     day_lookback = idx_d + 1
                     if ltp >= h_val:
                         days_high_hit = day_lookback
-                        price_rank_score = max(price_rank_score, day_lookback * 5)
+                        price_rank_score = max(price_rank_score, day_lookback * 4)
                     elif ltp <= l_val:
                         days_high_hit = -day_lookback
-                        price_rank_score = max(price_rank_score, day_lookback * 5)
+                        price_rank_score = max(price_rank_score, day_lookback * 4)
 
-            # --- FACTOR 2: Multi-Period Volume Comparison (1D, 5D, 10D, 20D) ---
+            # --- FACTOR 2: Multi-Period Volume Spikes ---
             vol_multiplier_score = 0.0
             if len(candles_20d) >= 21:
                 vols_list = [c[5] for c in candles_20d[1:21]]
@@ -481,9 +501,9 @@ def dashboard_live_loop():
                 r_10d = current_vol / vol_10d_avg if vol_10d_avg > 0 else 1.0
                 r_20d = current_vol / vol_20d_avg if vol_20d_avg > 0 else 1.0
                 
-                vol_multiplier_score = (r_1d * 1.0) + (r_5d * 1.5) + (r_10d * 2.0) + (r_20d * 2.5)
+                vol_multiplier_score = (r_1d * 0.5) + (r_5d * 1.0) + (r_10d * 1.5) + (r_20d * 2.0)
 
-            # --- FACTOR 3 & 4: Corrected 09:45 ORB Break, Momentum & Reversion Penalty ---
+            # --- FACTOR 3: Fixed 09:45 Opening Range Break (ORB) Engine ---
             orb_status = "No Break"
             orb_score = 0.0
             intra_candles = intraday_data_map.get(ikey, []) or intraday_data_map.get(ikey.replace('|', ':'), [])
@@ -491,10 +511,11 @@ def dashboard_live_loop():
                 opening_candles = []
                 for ic in intra_candles:
                     try:
-                        if isinstance(ic[0], (int, float)):
-                            dt_candle = datetime.fromtimestamp(ic[0]/1000, tz=IST)
+                        timestamp_val = ic[0]
+                        if isinstance(timestamp_val, (int, float)):
+                            dt_candle = datetime.fromtimestamp(timestamp_val / 1000.0, tz=IST)
                         else:
-                            dt_candle = pd.to_datetime(ic[0])
+                            dt_candle = pd.to_datetime(timestamp_val)
                             if dt_candle.tzinfo is None:
                                 dt_candle = dt_candle.tz_localize(IST)
                             else:
@@ -513,27 +534,17 @@ def dashboard_live_loop():
                     
                     if orb_high > 0 and orb_low < 999999:
                         if ltp > orb_high:
-                            mom_check = r['CHANGE_%']
-                            if mom_check > 0.5:
-                                orb_status = "Bullish ORB Break (+)"
-                                orb_score = 25.0
-                            else:
-                                orb_status = "Bullish ORB Re-entry/Pullback (-)"
-                                orb_score = -15.0
+                            orb_status = "Bullish ORB Break (+)"
+                            orb_score = 30.0
                         elif ltp < orb_low:
-                            mom_check = r['CHANGE_%']
-                            if mom_check < -0.5:
-                                orb_status = "Bearish ORB Break (-)"
-                                orb_score = 25.0
-                            else:
-                                orb_status = "Bearish ORB Re-entry/Pullback (+)"
-                                orb_score = -15.0
+                            orb_status = "Bearish ORB Break (-)"
+                            orb_score = 30.0
                         else:
                             orb_status = "Inside ORB Range"
                             orb_score = 0.0
 
-            base_bias_score = abs(r['INST_SCORE'])
-            composite_rank_score = base_bias_score + price_rank_score + vol_multiplier_score + orb_score
+            # Professional Institutional Composite Score weighting Net Money Flow heavily
+            composite_rank_score = abs(net_money_cr) * 1.5 + price_rank_score + vol_multiplier_score + orb_score
 
             ranked_records.append({
                 'SYMBOL': sym,
@@ -542,16 +553,16 @@ def dashboard_live_loop():
                 'Bias': st.session_state['tracked_session_symbols'][sym],
                 'LTP (₹)': ltp,
                 'Change %': r['CHANGE_STR'],
+                'Net Money Flow': r['Net Money Flow'],
                 '20D High/Low Zone': f"{days_high_hit:+d}D Zone" if days_high_hit != 0 else "Range Bound",
                 'Vol Multiplier': f"{vol_multiplier_score:.1f}pts",
                 'ORB 09:45 Status': orb_status,
-                'Order Flow': r['Order Flow'],
-                'Session Composite Score': round(composite_rank_score, 2)
+                'Session Institutional Score': round(composite_rank_score, 2)
             })
 
         session_ranked_df = pd.DataFrame(ranked_records)
         if not session_ranked_df.empty:
-            session_ranked_df = session_ranked_df.sort_values(by='Session Composite Score', ascending=False).reset_index(drop=True)
+            session_ranked_df = session_ranked_df.sort_values(by='Session Institutional Score', ascending=False).reset_index(drop=True)
             
             st.dataframe(
                 session_ranked_df,
@@ -560,6 +571,6 @@ def dashboard_live_loop():
                 hide_index=True
             )
     else:
-        st.info("Accumulating market leader stats for session ranking...")
+        st.info("Accumulating institutional leader stats for session ranking...")
 
 dashboard_live_loop()
