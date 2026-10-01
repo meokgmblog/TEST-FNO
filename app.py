@@ -251,14 +251,12 @@ def process_market_data(mapped_df, quotes_dict, avg_10d_vol_dict):
         sell_qty = float(quote.get('total_sell_quantity') or 0)
         total_qty_sum = buy_qty + sell_qty
         
-        # Professional Bounded Order Flow Ratio (capped between 0.1x and 10.0x to eliminate wild outliers)
         if total_qty_sum > 0:
             raw_flow = (buy_qty / total_qty_sum) * 2.0
             flow_ratio = max(0.1, min(10.0, raw_flow if buy_qty > sell_qty else (2.0 - (sell_qty / total_qty_sum) * 2.0)))
         else:
             flow_ratio = 1.0
 
-        # Institutional Net Money Inflow/Outflow in Crores (₹ Cr) = Turnover * (Buy Qty - Sell Qty) / Total Qty
         turnover_cr = (ltp * volume) / 10.0**7
         if total_qty_sum > 0:
             net_money_flow_cr = turnover_cr * ((buy_qty - sell_qty) / total_qty_sum)
@@ -289,11 +287,14 @@ def process_market_data(mapped_df, quotes_dict, avg_10d_vol_dict):
             'Vol / 10D Vol': f"{vol_ratio:.2f}x",
             'FLOW_RATIO_RAW': round(flow_ratio, 2),
             'Order Flow': f"{flow_ratio:.2f}x",
-            'NET_MONEY_FLOW_CR': net_money_flow_cr,
+            'NET_MONEY_FLOW_CR': round(net_money_flow_cr, 4),
             'Net Money Flow': format_money(net_money_flow_cr),
             'INST_SCORE': round(inst_score, 2),
         })
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    if not df.empty and 'NET_MONEY_FLOW_CR' not in df.columns:
+        df['NET_MONEY_FLOW_CR'] = 0.0
+    return df
 
 # ==========================================
 # 2. TIME CONTROL
@@ -354,8 +355,8 @@ def dashboard_live_loop():
                 st.session_state['frozen_time'] = now_str
                 st.session_state['frozen_date'] = today_str
 
-    if data_df.empty:
-        st.error("⚠️ **Unable to load live quotes from Upstox API.**")
+    if data_df.empty or 'NET_MONEY_FLOW_CR' not in data_df.columns:
+        st.error("⚠️ **Unable to load live quotes or parse required columns from Upstox API.**")
         if 'api_error' in locals() and api_error:
             st.code(f"Upstox Response Error Log:\n{api_error}", language="text")
         return
@@ -365,7 +366,7 @@ def dashboard_live_loop():
     sector_stats = []
     for sector, group in data_df.groupby('SECTOR'):
         avg_chg = group['CHANGE_%'].mean()
-        total_inflow = group['NET_MONEY_FLOW_CR'].sum()
+        total_inflow = group['NET_MONEY_FLOW_CR'].sum() if 'NET_MONEY_FLOW_CR' in group.columns else 0.0
         advances = (group['CHANGE_%'] > 0).sum()
         declines = (group['CHANGE_%'] < 0).sum()
         total_stocks = len(group)
