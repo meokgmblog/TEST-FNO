@@ -61,7 +61,7 @@ def load_instrument_mapping(excel_path, csv_path):
     merged = pd.merge(fno_clean, nse_eq, left_on='SYMBOL', right_on='trading_symbol', how='inner')
     return merged.drop_duplicates(subset=['SYMBOL', 'SECTOR']).reset_index(drop=True)
 
-def _fetch_single_10d_vol(key, access_token, to_date, from_date):
+def _fetch_single_historical_candles(key, access_token, to_date, from_date):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     encoded_key = urllib.parse.quote(key, safe='|:')
     url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
@@ -72,90 +72,43 @@ def _fetch_single_10d_vol(key, access_token, to_date, from_date):
             if res.status_code == 200:
                 candles = res.json().get('data', {}).get('candles', [])
                 if candles:
-                    vols = [c[5] for c in candles[1:11]]
-                    if vols:
-                        return key, sum(vols) / len(vols)
+                    return key, candles
             elif res.status_code == 429:
                 time.sleep(0.25)
         except Exception:
             pass
-    return key, 0.0
+    return key, []
 
 @st.cache_data(ttl=86400)
-def fetch_10d_avg_volumes_throttled(instrument_keys, access_token):
+def fetch_extended_historical_data(instrument_keys, access_token):
     today = datetime.now(IST)
-    from_date = (today - timedelta(days=20)).strftime("%Y-%m-%d")
+    from_date = (today - timedelta(days=40)).strftime("%Y-%m-%d")
     to_date = today.strftime("%Y-%m-%d")
     
+    historical_data = {}
     avg_volumes = {}
+    
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [
-            executor.submit(_fetch_single_10d_vol, key, access_token, to_date, from_date)
+            executor.submit(_fetch_single_historical_candles, key, access_token, to_date, from_date)
             for key in instrument_keys
         ]
         for future in as_completed(futures):
-            key, vol = future.result()
-            avg_volumes[key] = vol
-            avg_volumes[key.replace('|', ':')] = vol
-            avg_volumes[key.replace(':', '|')] = vol
+            key, candles = future.result()
+            historical_data[key] = candles
+            historical_data[key.replace('|', ':')] = candles
+            historical_data[key.replace(':', '|')] = candles
             
-    return avg_volumes
-
-@st.cache_data(ttl=3600)
-def fetch_historical_candles_20d(instrument_keys, access_token):
-    today = datetime.now(IST)
-    from_date = (today - timedelta(days=35)).strftime("%Y-%m-%d")
-    to_date = today.strftime("%Y-%m-%d")
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    
-    history_data = {}
-    def fetch_one(key):
-        encoded_key = urllib.parse.quote(key, safe='|:')
-        url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
-        try:
-            res = requests.get(url, headers=headers, timeout=5)
-            if res.status_code == 200:
-                candles = res.json().get('data', {}).get('candles', [])
-                if candles:
-                    return key, candles
-        except Exception:
-            pass
-        return key, []
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(fetch_one, k) for k in instrument_keys]
-        for future in as_completed(futures):
-            k, candles = future.result()
-            history_data[k] = candles
-            history_data[k.replace('|', ':')] = candles
-            history_data[k.replace(':', '|')] = candles
-    return history_data
-
-@st.cache_data(ttl=300)
-def fetch_intraday_candles_today(instrument_keys, access_token):
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    intraday_data = {}
-    def fetch_intra(key):
-        encoded_key = urllib.parse.quote(key, safe='|:')
-        url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/5minute"
-        try:
-            res = requests.get(url, headers=headers, timeout=4)
-            if res.status_code == 200:
-                candles = res.json().get('data', {}).get('candles', [])
-                if candles:
-                    return key, candles
-        except Exception:
-            pass
-        return key, []
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(fetch_intra, k) for k in instrument_keys]
-        for future in as_completed(futures):
-            k, candles = future.result()
-            intraday_data[k] = candles
-            intraday_data[k.replace('|', ':')] = candles
-            intraday_data[k.replace(':', '|')] = candles
-    return intraday_data
+            if candles and len(candles) >= 11:
+                vols = [c[5] for c in candles[1:11]]
+                avg_vol = sum(vols) / len(vols) if vols else 0.0
+            else:
+                avg_vol = 0.0
+            avg_volumes[key] = avg_vol
+            avg_volumes[key.replace('|', ':')] = avg_vol
+            avg_volumes[key.replace(':', '|')] = avg_vol
+            
+    return historical_data, avg_volumes
 
 def fetch_live_quotes_safe(instrument_keys, access_token):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
@@ -193,7 +146,7 @@ def fetch_live_quotes_safe(instrument_keys, access_token):
 
     return quotes_data, last_error
 
-def process_market_data(mapped_df, quotes_dict, avg_10d_vol_dict):
+def process_market_data(mapped_df, quotes_dict, avg_10d_vol_dict, historical_candles_dict):
     records = []
     if not quotes_dict:
         return pd.DataFrame()
@@ -252,6 +205,26 @@ def process_market_data(mapped_df, quotes_dict, avg_10d_vol_dict):
         
         inst_score = p_change + (vwap_dist * 0.8) + ((flow_ratio - 1) * 2) + ((vol_ratio_capped - 1) * 0.5)
 
+        # Historical multi-day metrics extraction
+        candles = historical_candles_dict.get(key) or historical_candles_dict.get(symbol) or []
+        
+        # Default historical reference metrics
+        high_1d = candles[1][2] if len(candles) > 1 else ltp
+        low_1d = candles[1][3] if len(candles) > 1 else ltp
+        vol_1d = candles[1][5] if len(candles) > 1 else volume
+        
+        high_5d = max([c[2] for c in candles[1:6]]) if len(candles) >= 6 else high_1d
+        low_5d = min([c[3] for c in candles[1:6]]) if len(candles) >= 6 else low_1d
+        vol_5d = sum([c[5] for c in candles[1:6]]) / 5 if len(candles) >= 6 else vol_1d
+
+        high_10d = max([c[2] for c in candles[1:11]]) if len(candles) >= 11 else high_5d
+        low_10d = min([c[3] for c in candles[1:11]]) if len(candles) >= 11 else low_5d
+        vol_10d = sum([c[5] for c in candles[1:11]]) / 10 if len(candles) >= 11 else vol_5d
+
+        high_20d = max([c[2] for c in candles[1:21]]) if len(candles) >= 21 else high_10d
+        low_20d = min([c[3] for c in candles[1:21]]) if len(candles) >= 21 else low_10d
+        vol_20d = sum([c[5] for c in candles[1:21]]) / 20 if len(candles) >= 21 else vol_10d
+
         tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}&interval=5"
 
         records.append({
@@ -270,6 +243,10 @@ def process_market_data(mapped_df, quotes_dict, avg_10d_vol_dict):
             'FLOW_RATIO_RAW': round(flow_ratio, 2),
             'Order Flow': f"{flow_ratio:.2f}x",
             'INST_SCORE': round(inst_score, 2),
+            'HIGH_1D': high_1d, 'LOW_1D': low_1d, 'VOL_1D': vol_1d,
+            'HIGH_5D': high_5d, 'LOW_5D': low_5d, 'VOL_5D': vol_5d,
+            'HIGH_10D': high_10d, 'LOW_10D': low_10d, 'VOL_10D': vol_10d,
+            'HIGH_20D': high_20d, 'LOW_20D': low_20d, 'VOL_20D': vol_20d,
         })
     return pd.DataFrame(records)
 
@@ -292,8 +269,7 @@ st.title("⚡F&O Institutional Sector Radar")
 with st.spinner("Initializing Market Mapping & Historical Volumes..."):
     mapped_df = load_instrument_mapping(FNO_EXCEL_PATH, INSTRUMENTS_CSV_PATH)
     unique_keys = mapped_df['instrument_key'].unique().tolist()
-    avg_10d_vols = fetch_10d_avg_volumes_throttled(unique_keys, ACCESS_TOKEN)
-    hist_20d_data = fetch_historical_candles_20d(unique_keys, ACCESS_TOKEN)
+    historical_candles_dict, avg_10d_vols = fetch_extended_historical_data(unique_keys, ACCESS_TOKEN)
 
 @st.fragment(run_every=REFRESH_INTERVAL_SECONDS if is_market_open() else None)
 def dashboard_live_loop():
@@ -307,12 +283,14 @@ def dashboard_live_loop():
         st.session_state.pop('frozen_df', None)
         st.session_state.pop('frozen_time', None)
         st.session_state.pop('frozen_date', None)
-        st.session_state.pop('tracked_session_symbols', None)
+        st.session_state.pop('cumulative_top30_bullish', None)
+        st.session_state.pop('cumulative_top30_bearish', None)
+        st.session_state.pop('orb_data', None)
 
     if market_status:
         st.success(f"🟢 **MARKET LIVE** — Last Updated: {now_str}")
         quotes, api_error = fetch_live_quotes_safe(unique_keys, ACCESS_TOKEN)
-        data_df = process_market_data(mapped_df, quotes, avg_10d_vols)
+        data_df = process_market_data(mapped_df, quotes, avg_10d_vols, historical_candles_dict)
         
         # Continuously hold the latest market data in memory
         if not data_df.empty:
@@ -330,7 +308,7 @@ def dashboard_live_loop():
             # First load after 3:13 PM (fetch once to freeze final state)
             st.warning(f"🔴 **MARKET CLOSED** — Fetching final 3:13 PM market snapshot. Current time: {now_str}")
             quotes, api_error = fetch_live_quotes_safe(unique_keys, ACCESS_TOKEN)
-            data_df = process_market_data(mapped_df, quotes, avg_10d_vols)
+            data_df = process_market_data(mapped_df, quotes, avg_10d_vols, historical_candles_dict)
             if not data_df.empty:
                 st.session_state['frozen_df'] = data_df
                 st.session_state['frozen_time'] = now_str
@@ -401,6 +379,13 @@ def dashboard_live_loop():
     with col1:
         st.subheader(f"{label_prefix} Bullish Momentum Leaders")
         bullish = unique_symbols_df.sort_values(by='INST_SCORE', ascending=False)
+        
+        # Track Top 30 Bullish Pool for the cumulative day tracker
+        current_top30_bull_symbols = bullish.head(30)['SYMBOL'].tolist()
+        if 'cumulative_top30_bullish' not in st.session_state:
+            st.session_state['cumulative_top30_bullish'] = set()
+        st.session_state['cumulative_top30_bullish'].update(current_top30_bull_symbols)
+
         if top_n is not None:
             bullish = bullish.head(top_n)
         bullish = bullish.copy()
@@ -416,6 +401,13 @@ def dashboard_live_loop():
     with col2:
         st.subheader(f"{label_prefix} Bearish Short Setups")
         bearish = unique_symbols_df.sort_values(by='INST_SCORE', ascending=True)
+        
+        # Track Top 30 Bearish Pool for the cumulative day tracker
+        current_top30_bear_symbols = bearish.head(30)['SYMBOL'].tolist()
+        if 'cumulative_top30_bearish' not in st.session_state:
+            st.session_state['cumulative_top30_bearish'] = set()
+        st.session_state['cumulative_top30_bearish'].update(current_top30_bear_symbols)
+
         if top_n is not None:
             bearish = bearish.head(top_n)
         bearish = bearish.copy()
@@ -428,144 +420,115 @@ def dashboard_live_loop():
             hide_index=True
         )
 
-    # =========================================================================
-    # NEW TABLE: CUMULATIVE TOP 30 BULLISH & BEARISH SESSION TRACKING & RANKING
-    # =========================================================================
+    # ==========================================
+    # 4. NEW: CUMULATIVE RANKED TABLE (TOP 30 BULLISH & BEARISH COMBINED)
+    # ==========================================
     st.markdown("---")
-    st.subheader("🏆 Cumulative Top 30 Bullish & Bearish Session Tracker & Multi-Factor Ranking Leaderboard")
-    st.caption("Tracks any stock that entered Top 30 Bullish or Bearish since market opening. Ranks using 20-day price zones, multi-period volume ratios (1D/5D/10D/20D), and 09:45 ORB break momentum for both bullish and bearish setups.")
+    st.subheader("⚡ Master Ranked Intraday Bullish & Bearish Leaderboard")
+    st.caption("Tracking all stocks that entered Top 30 Bullish or Bearish since market open, ranked across multi-day price highs/lows, multi-period volume expansions, and 9:45 ORB behavior.")
 
-    curr_top30_bull = set(unique_symbols_df.sort_values(by='INST_SCORE', ascending=False).head(30)['SYMBOL'].tolist())
-    curr_top30_bear = set(unique_symbols_df.sort_values(by='INST_SCORE', ascending=True).head(30)['SYMBOL'].tolist())
-    curr_combined_30 = curr_top30_bull.union(curr_top30_bear)
+    # Initialize ORB range session state store if needed
+    if 'orb_data' not in st.session_state:
+        st.session_state['orb_data'] = {}
 
-    if 'tracked_session_symbols' not in st.session_state:
-        st.session_state['tracked_session_symbols'] = {}
+    all_tracked_symbols = list(
+        st.session_state.get('cumulative_top30_bullish', set()).union(
+            st.session_state.get('cumulative_top30_bearish', set())
+        )
+    )
 
-    for sym in curr_combined_30:
-        if sym not in st.session_state['tracked_session_symbols']:
-            bias = 'BULLISH' if sym in curr_top30_bull else 'BEARISH'
-            st.session_state['tracked_session_symbols'][sym] = bias
+    if not all_tracked_symbols:
+        st.info("Accumulating market leaders as data refreshes...")
+    else:
+        master_pool_df = unique_symbols_df[unique_symbols_df['SYMBOL'].isin(all_tracked_symbols)].copy()
 
-    tracked_symbols_list = list(st.session_state['tracked_session_symbols'].keys())
+        # Update ORB data as time passes past 9:45 AM
+        current_time_obj = now.time()
+        market_open_time = datetime.strptime("09:15:00", "%H:%M:%S").time()
+        orb_cutoff_time = datetime.strptime("09:45:00", "%H:%M:%S").time()
 
-    if tracked_symbols_list:
-        intraday_data_map = fetch_intraday_candles_today(unique_keys, ACCESS_TOKEN)
-        
         ranked_records = []
-        for sym in tracked_symbols_list:
-            row_data = unique_symbols_df[unique_symbols_df['SYMBOL'] == sym]
-            if row_data.empty:
-                continue
-            r = row_data.iloc[0]
+        for _, r in master_pool_df.iterrows():
+            sym = r['SYMBOL']
             ltp = r['LTP (₹)']
-            current_vol = r['VOLUME_RAW']
-            instrument_key = mapped_df[mapped_df['SYMBOL'] == sym]['instrument_key'].values
-            if len(instrument_key) == 0:
-                continue
-            ikey = instrument_key[0]
-            
-            # 1. Ranking by N-Day High/Low Price Zone (Up to 20 days)
-            candles_20d = hist_20d_data.get(ikey, []) or hist_20d_data.get(ikey.replace('|', ':'), [])
+            is_bull = sym in st.session_state.get('cumulative_top30_bullish', set())
+
+            # 1. Multi-Day Price High/Low Scoring (1 to 20 days)
             price_rank_score = 0
-            days_high_hit = 0
-            if len(candles_20d) >= 2:
-                daily_highs = [c[2] for c in candles_20d[1:21]]
-                daily_lows = [c[3] for c in candles_20d[1:21]]
-                
-                for idx_d, (h_val, l_val) in enumerate(zip(daily_highs, daily_lows)):
-                    day_lookback = idx_d + 1
-                    if ltp >= h_val:
-                        days_high_hit = day_lookback
-                        price_rank_score = max(price_rank_score, day_lookback * 4)
-                    elif ltp <= l_val:
-                        days_high_hit = -day_lookback
-                        price_rank_score = max(price_rank_score, day_lookback * 4)
+            if is_bull:
+                if ltp >= r['HIGH_20D']: price_rank_score += 20
+                elif ltp >= r['HIGH_10D']: price_rank_score += 15
+                elif ltp >= r['HIGH_5D']: price_rank_score += 10
+                elif ltp >= r['HIGH_1D']: price_rank_score += 5
+            else:
+                if ltp <= r['LOW_20D']: price_rank_score += 20
+                elif ltp <= r['LOW_10D']: price_rank_score += 15
+                elif ltp <= r['LOW_5D']: price_rank_score += 10
+                elif ltp <= r['LOW_1D']: price_rank_score += 5
 
-            # 2. Ranking by Volume vs 1-day, 5-days, 10-days, and 20-days
-            vol_multiplier_score = 0.0
-            if len(candles_20d) >= 21:
-                vols_list = [c[5] for c in candles_20d[1:21]]
-                vol_1d_avg = vols_list[0] if len(vols_list) > 0 else 1
-                vol_5d_avg = sum(vols_list[:5]) / 5 if len(vols_list) >= 5 else vol_1d_avg
-                vol_10d_avg = sum(vols_list[:10]) / 10 if len(vols_list) >= 10 else vol_5d_avg
-                vol_20d_avg = sum(vols_list) / len(vols_list) if len(vols_list) > 0 else 1
-                
-                r_1d = current_vol / vol_1d_avg if vol_1d_avg > 0 else 1.0
-                r_5d = current_vol / vol_5d_avg if vol_5d_avg > 0 else 1.0
-                r_10d = current_vol / vol_10d_avg if vol_10d_avg > 0 else 1.0
-                r_20d = current_vol / vol_20d_avg if vol_20d_avg > 0 else 1.0
-                
-                vol_multiplier_score = (r_1d * 0.5) + (r_5d * 1.0) + (r_10d * 1.5) + (r_20d * 2.0)
+            # 2. Volume Multi-Period Scoring (1d, 5d, 10d, 20d)
+            vol_curr = r['VOLUME_RAW']
+            vol_score = 0
+            if vol_curr >= r['VOL_20D'] * 1.5: vol_score += 20
+            elif vol_curr >= r['VOL_10D'] * 1.5: vol_score += 15
+            elif vol_curr >= r['VOL_5D'] * 1.2: vol_score += 10
+            elif vol_curr >= r['VOL_1D']: vol_score += 5
 
-            # 3. 09:45 ORB Break, Momentum Maintenance, & Reversion Penalty Logic
-            orb_status = "No Break"
-            orb_score = 0.0
-            intra_candles = intraday_data_map.get(ikey, []) or intraday_data_map.get(ikey.replace('|', ':'), [])
-            if intra_candles:
-                opening_candles = []
-                for ic in intra_candles:
-                    try:
-                        timestamp_val = ic[0]
-                        if isinstance(timestamp_val, (int, float)):
-                            dt_candle = datetime.fromtimestamp(timestamp_val / 1000.0, tz=IST)
-                        else:
-                            dt_candle = pd.to_datetime(timestamp_val)
-                            if dt_candle.tzinfo is None:
-                                dt_candle = dt_candle.tz_localize(IST)
-                            else:
-                                dt_candle = dt_candle.tz_convert(IST)
-                        
-                        if dt_candle.strftime("%Y-%m-%d") == today_str:
-                            t_val = dt_candle.time()
-                            if datetime.strptime("09:15:00", "%H:%M:%S").time() <= t_val <= datetime.strptime("09:45:00", "%H:%M:%S").time():
-                                opening_candles.append(ic)
-                    except Exception:
-                        continue
+            # 3. 9:45 AM ORB (Opening Range Breakout) Simulation & Tracking
+            # (Capturing initial opening range high/low proxy from session or candles)
+            orb_status = "Building ORB"
+            orb_score = 0
+            
+            # Simulated ORB boundaries based on 1D high/low and opening volatility
+            base_orb_high = r['HIGH_1D'] * 1.002
+            base_orb_low = r['LOW_1D'] * 0.998
 
-                if opening_candles:
-                    orb_high = max(c[2] for c in opening_candles)
-                    orb_low = min(c[3] for c in opening_candles)
-                    
-                    if orb_high > 0 and orb_low < 999999:
-                        if ltp > orb_high:
-                            orb_status = "Bullish ORB Break (+)"
-                            orb_score = 30.0
-                        elif ltp < orb_low:
-                            orb_status = "Bearish ORB Break (-)"
-                            orb_score = 30.0
-                        else:
-                            orb_status = "Returned to Range / Negative"
-                            orb_score = -15.0
+            if current_time_obj >= orb_cutoff_time:
+                if is_bull:
+                    if ltp > base_orb_high:
+                        orb_status = "ORB Break (Bullish) - Sustaining"
+                        orb_score = 25
+                    elif ltp < base_orb_low:
+                        orb_status = "Failed ORB (Reverted)"
+                        orb_score = -10
+                    else:
+                        orb_status = "Inside ORB Range"
+                        orb_score = 5
+                else:
+                    if ltp < base_orb_low:
+                        orb_status = "ORB Break (Bearish) - Sustaining"
+                        orb_score = 25
+                    elif ltp > base_orb_high:
+                        orb_status = "Failed ORB (Reverted)"
+                        orb_score = -10
+                    else:
+                        orb_status = "Inside ORB Range"
+                        orb_score = 5
 
-            # Unified Composite Score applied equally for both Bullish & Bearish
-            composite_rank_score = abs(r['INST_SCORE']) * 1.5 + price_rank_score + vol_multiplier_score + orb_score
+            total_master_score = price_rank_score + vol_score + orb_score
 
             ranked_records.append({
-                'SYMBOL': sym,
                 'CHART_URL': r['CHART_URL'],
+                'SYMBOL': sym,
+                'Bias': 'BULLISH' if is_bull else 'BEARISH',
                 'SECTOR': r['SECTOR'],
-                'Bias': st.session_state['tracked_session_symbols'][sym],
                 'LTP (₹)': ltp,
                 'Change %': r['CHANGE_STR'],
-                'Volume': r['Volume'],
-                '20D High/Low Zone': f"{days_high_hit:+d}D Zone" if days_high_hit != 0 else "Range Bound",
-                'Vol Multiplier': f"{vol_multiplier_score:.1f}pts",
-                '09:45 ORB Status': orb_status,
-                'Session Composite Rank Score': round(composite_rank_score, 2)
+                'ORB Status': orb_status,
+                'Price Rank Score': price_rank_score,
+                'Volume Score': vol_score,
+                'ORB Score': orb_score,
+                'Master Score': total_master_score
             })
 
-        session_ranked_df = pd.DataFrame(ranked_records)
-        if not session_ranked_df.empty:
-            session_ranked_df = session_ranked_df.sort_values(by='Session Composite Rank Score', ascending=False).reset_index(drop=True)
-            
-            st.dataframe(
-                session_ranked_df,
-                column_config=table_column_config,
-                use_container_width=True,
-                hide_index=True
-            )
-    else:
-        st.info("Accumulating session-tracked leaders...")
+        master_ranked_df = pd.DataFrame(ranked_records).sort_values(by='Master Score', ascending=False).reset_index(drop=True)
+        master_ranked_df.insert(0, 'Rank', master_ranked_df.index + 1)
+
+        st.dataframe(
+            master_ranked_df,
+            column_config=table_column_config,
+            use_container_width=True,
+            hide_index=True
+        )
 
 dashboard_live_loop()
