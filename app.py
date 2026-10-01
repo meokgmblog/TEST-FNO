@@ -12,7 +12,7 @@ import streamlit as st
 # PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(
-    page_title="F&O Institutional Sector & Money Flow Radar",
+    page_title="F&O Institutional Sector Radar",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -36,6 +36,7 @@ if not os.path.exists(FNO_EXCEL_PATH) or not os.path.exists(INSTRUMENTS_CSV_PATH
 # FORMATTING HELPERS
 # ==========================================
 def format_volume(vol):
+    """Formats raw volume into standard K/M units."""
     if vol >= 1_000_000:
         return f"{vol / 1_000_000:.2f}M"
     elif vol >= 1_000:
@@ -43,16 +44,8 @@ def format_volume(vol):
     return str(int(vol))
 
 def format_signed_pct(val):
+    """Formats percentage with explicit + / - signs."""
     return f"+{val:.2f}%" if val > 0 else f"{val:.2f}%"
-
-def format_money(val_cr):
-    """Formats institutional cash flow into Crores (₹)."""
-    if abs(val_cr) >= 100:
-        return f"₹{val_cr:+,.1f} Cr"
-    elif abs(val_cr) >= 1:
-        return f"₹{val_cr:+,.2f} Cr"
-    else:
-        return f"₹{val_cr * 100:+,.1f} Lakhs"
 
 # ==========================================
 # 1. DATA LOADING & RATE-LIMITED FETCHING
@@ -168,8 +161,7 @@ def fetch_live_quotes_safe(instrument_keys, access_token):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     url = "https://api.upstox.com/v2/market-quote/quotes"
     
-    # Safe chunking (Upstox limit is 500, using 200 to be completely safe against URL length limits)
-    batch_size = 200
+    batch_size = 250
     batches = [instrument_keys[i:i + batch_size] for i in range(0, len(instrument_keys), batch_size)]
     
     quotes_data = {}
@@ -178,30 +170,26 @@ def fetch_live_quotes_safe(instrument_keys, access_token):
     for idx, chunk in enumerate(batches):
         keys_param = ",".join(chunk)
         try:
-            # Let requests handle the url-encoding securely via 'params' dictionary
-            res = requests.get(url, headers=headers, params={'instrument_key': keys_param}, timeout=8)
+            encoded_params = urllib.parse.urlencode({'instrument_key': keys_param}, safe=',|:')
+            res = requests.get(f"{url}?{encoded_params}", headers=headers, timeout=6)
             
-            if res.status_code == 200:
-                resp_json = res.json()
-                if resp_json.get('status') == 'success':
-                    quotes_data.update(resp_json.get('data', {}))
-                else:
-                    last_error = f"API Error Status: {resp_json}"
+            if res.status_code == 200 and res.json().get('status') == 'success':
+                quotes_data.update(res.json().get('data', {}))
             elif res.status_code == 429:
-                last_error = "HTTP 429 Rate Limit hit. Retrying..."
+                last_error = "HTTP 429 Rate Limit hit. Retrying after brief pause..."
                 time.sleep(0.5)
-                res_retry = requests.get(url, headers=headers, params={'instrument_key': keys_param}, timeout=8)
-                if res_retry.status_code == 200 and res_retry.json().get('status') == 'success':
+                res_retry = requests.get(f"{url}?{encoded_params}", headers=headers, timeout=6)
+                if res_retry.status_code == 200:
                     quotes_data.update(res_retry.json().get('data', {}))
                 else:
-                    last_error = f"HTTP 429 Retry Failed: {res_retry.text}"
+                    last_error = f"HTTP {res_retry.status_code}: {res_retry.text}"
             else:
                 last_error = f"HTTP {res.status_code}: {res.text}"
         except Exception as e:
             last_error = str(e)
             
         if idx < len(batches) - 1:
-            time.sleep(0.1)
+            time.sleep(0.15)
 
     return quotes_data, last_error
 
@@ -254,26 +242,15 @@ def process_market_data(mapped_df, quotes_dict, avg_10d_vol_dict):
         
         buy_qty = float(quote.get('total_buy_quantity') or 0)
         sell_qty = float(quote.get('total_sell_quantity') or 0)
-        total_qty_sum = buy_qty + sell_qty
-        
-        if total_qty_sum > 0:
-            raw_flow = (buy_qty / total_qty_sum) * 2.0
-            flow_ratio = max(0.1, min(10.0, raw_flow if buy_qty > sell_qty else (2.0 - (sell_qty / total_qty_sum) * 2.0)))
-        else:
-            flow_ratio = 1.0
-
-        turnover_cr = (ltp * volume) / 10.0**7
-        if total_qty_sum > 0:
-            net_money_flow_cr = turnover_cr * ((buy_qty - sell_qty) / total_qty_sum)
-        else:
-            net_money_flow_cr = turnover_cr * (1.0 if p_change > 0 else -1.0) if volume > 0 else 0.0
         
         avg_vol = avg_10d_vol_dict.get(key, 0.0) or avg_10d_vol_dict.get(symbol, 0.0)
         vol_ratio = (volume / avg_vol) if avg_vol > 0 else 1.0
         vol_ratio_capped = min(vol_ratio, 10.0)
         
         vwap_dist = ((ltp - vwap) / vwap * 100) if vwap > 0 else 0.0
-        inst_score = p_change + (vwap_dist * 0.8) + (net_money_flow_cr * 0.1) + ((vol_ratio_capped - 1) * 0.5)
+        flow_ratio = (buy_qty / sell_qty) if sell_qty > 0 else (1.5 if buy_qty > 0 else 1.0)
+        
+        inst_score = p_change + (vwap_dist * 0.8) + ((flow_ratio - 1) * 2) + ((vol_ratio_capped - 1) * 0.5)
 
         tv_url = f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}&interval=5"
 
@@ -292,14 +269,9 @@ def process_market_data(mapped_df, quotes_dict, avg_10d_vol_dict):
             'Vol / 10D Vol': f"{vol_ratio:.2f}x",
             'FLOW_RATIO_RAW': round(flow_ratio, 2),
             'Order Flow': f"{flow_ratio:.2f}x",
-            'NET_MONEY_FLOW_CR': round(net_money_flow_cr, 4),
-            'Net Money Flow': format_money(net_money_flow_cr),
             'INST_SCORE': round(inst_score, 2),
         })
-    df = pd.DataFrame(records)
-    if not df.empty and 'NET_MONEY_FLOW_CR' not in df.columns:
-        df['NET_MONEY_FLOW_CR'] = 0.0
-    return df
+    return pd.DataFrame(records)
 
 # ==========================================
 # 2. TIME CONTROL
@@ -315,7 +287,7 @@ def is_market_open():
 # ==========================================
 # 3. STREAMLIT RENDER LOGIC
 # ==========================================
-st.title("⚡F&O Institutional Sector & Money Flow Radar")
+st.title("⚡F&O Institutional Sector Radar")
 
 with st.spinner("Initializing Market Mapping & Historical Volumes..."):
     mapped_df = load_instrument_mapping(FNO_EXCEL_PATH, INSTRUMENTS_CSV_PATH)
@@ -330,6 +302,7 @@ def dashboard_live_loop():
     now_str = now.strftime("%H:%M:%S IST")
     today_str = now.strftime("%Y-%m-%d")
 
+    # Reset cache if a new trading day starts
     if 'frozen_date' in st.session_state and st.session_state['frozen_date'] != today_str:
         st.session_state.pop('frozen_df', None)
         st.session_state.pop('frozen_time', None)
@@ -341,17 +314,20 @@ def dashboard_live_loop():
         quotes, api_error = fetch_live_quotes_safe(unique_keys, ACCESS_TOKEN)
         data_df = process_market_data(mapped_df, quotes, avg_10d_vols)
         
+        # Continuously hold the latest market data in memory
         if not data_df.empty:
             st.session_state['frozen_df'] = data_df
             st.session_state['frozen_time'] = now_str
             st.session_state['frozen_date'] = today_str
     else:
+        # Market is CLOSED (After 3:13 PM or Before 9:14 AM / Weekends)
         if 'frozen_df' in st.session_state and not st.session_state['frozen_df'].empty:
             data_df = st.session_state['frozen_df']
             frozen_at = st.session_state.get('frozen_time', '3:13:00 IST')
             st.warning(f"🔴 **MARKET CLOSED — FROZEN AT 3:13 PM IST** (Data locked at: {frozen_at})")
             api_error = None
         else:
+            # First load after 3:13 PM (fetch once to freeze final state)
             st.warning(f"🔴 **MARKET CLOSED** — Fetching final 3:13 PM market snapshot. Current time: {now_str}")
             quotes, api_error = fetch_live_quotes_safe(unique_keys, ACCESS_TOKEN)
             data_df = process_market_data(mapped_df, quotes, avg_10d_vols)
@@ -360,39 +336,39 @@ def dashboard_live_loop():
                 st.session_state['frozen_time'] = now_str
                 st.session_state['frozen_date'] = today_str
 
-    if data_df.empty or 'NET_MONEY_FLOW_CR' not in data_df.columns:
-        st.error("⚠️ **Unable to load live quotes or parse required columns from Upstox API.**")
+    if data_df.empty:
+        st.error("⚠️ **Unable to load live quotes from Upstox API.**")
         if 'api_error' in locals() and api_error:
             st.code(f"Upstox Response Error Log:\n{api_error}", language="text")
         return
 
     # --- Sector Summary Table ---
-    st.subheader("Sector Performance & Institutional Net Inflow Breakdown")
+    st.subheader("Sector Performance Breakdown")
     sector_stats = []
     for sector, group in data_df.groupby('SECTOR'):
         avg_chg = group['CHANGE_%'].mean()
-        total_inflow = group['NET_MONEY_FLOW_CR'].sum() if 'NET_MONEY_FLOW_CR' in group.columns else 0.0
         advances = (group['CHANGE_%'] > 0).sum()
         declines = (group['CHANGE_%'] < 0).sum()
         total_stocks = len(group)
         breadth_ratio = (advances - declines) / total_stocks if total_stocks > 0 else 0.0
         top_stock = group.loc[group['INST_SCORE'].idxmax()]['SYMBOL'] if not group.empty else "N/A"
-        sector_score = avg_chg + (0.75 * breadth_ratio) + (total_inflow * 0.01)
+        sector_score = avg_chg + (0.75 * breadth_ratio)
         
         sector_stats.append({
             "Sector": sector,
             "Avg Change %": format_signed_pct(avg_chg),
-            "Net Money Flow": format_money(total_inflow),
             "Adv/Dec": f"{advances}/{declines}",
             "Breadth Ratio": f"{breadth_ratio:+.2f}",
+            "Avg Order Flow": f"{group['FLOW_RATIO_RAW'].mean():.2f}x",
             "Top Stock": top_stock,
-            "Sector Sentiment": "BULLISH" if sector_score > 0.3 else ("BEARISH" if sector_score < -0.3 else "NEUTRAL"),
-            "_SORT_INFLOW": total_inflow
+            "Sector Momentum": "BULLISH" if sector_score > 0.3 else ("BEARISH" if sector_score < -0.3 else "NEUTRAL"),
+            "_SORT_CHG": avg_chg
         })
     
-    sector_df = pd.DataFrame(sector_stats).sort_values(by="_SORT_INFLOW", ascending=False).drop(columns=['_SORT_INFLOW'])
+    sector_df = pd.DataFrame(sector_stats).sort_values(by="_SORT_CHG", ascending=False).drop(columns=['_SORT_CHG'])
     st.dataframe(sector_df, use_container_width=True, hide_index=True)
 
+    # --- Table Config for Interactive TradingView Chart Hyperlinks ---
     table_column_config = {
         "CHART_URL": st.column_config.LinkColumn(
             "Symbol",
@@ -401,8 +377,10 @@ def dashboard_live_loop():
         )
     }
 
+    # --- Deduplicate Stocks for Leaders ---
     unique_symbols_df = data_df.drop_duplicates(subset=['SYMBOL'])
 
+    # --- Display Count Selection ---
     display_option = st.selectbox(
         "Select Number of Stocks to Display:",
         options=["Top 10", "Top 20", "All"],
@@ -421,32 +399,44 @@ def dashboard_live_loop():
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader(f"{label_prefix} Bullish Institutional Inflow Leaders")
-        bullish = unique_symbols_df.sort_values(by='NET_MONEY_FLOW_CR', ascending=False)
-        bullish_display = bullish.head(top_n) if top_n is not None else bullish
-        bullish_display = bullish_display.copy()
-        bullish_display.rename(columns={'CHANGE_STR': 'Change %', 'VWAP_DIST_STR': 'VWAP Dist %', 'INST_SCORE': 'Inst. Score'}, inplace=True)
-        cols_bullish = ['CHART_URL', 'SECTOR', 'LTP (₹)', 'Change %', 'Net Money Flow', 'VWAP Dist %', 'Volume', 'Vol / 10D Vol', 'Inst. Score']
-        st.dataframe(bullish_display[cols_bullish], column_config=table_column_config, use_container_width=True, hide_index=True)
+        st.subheader(f"{label_prefix} Bullish Momentum Leaders")
+        bullish = unique_symbols_df.sort_values(by='INST_SCORE', ascending=False)
+        if top_n is not None:
+            bullish = bullish.head(top_n)
+        bullish = bullish.copy()
+        bullish.rename(columns={'CHANGE_STR': 'Change %', 'VWAP_DIST_STR': 'VWAP Dist %', 'INST_SCORE': 'Inst. Score'}, inplace=True)
+        cols_bullish = ['CHART_URL', 'SECTOR', 'LTP (₹)', 'Change %', 'VWAP Dist %', 'Volume', 'Vol / 10D Vol', 'Order Flow', 'Inst. Score']
+        st.dataframe(
+            bullish[cols_bullish],
+            column_config=table_column_config,
+            use_container_width=True,
+            hide_index=True
+        )
 
     with col2:
-        st.subheader(f"{label_prefix} Bearish Institutional Outflow Leaders")
-        bearish = unique_symbols_df.sort_values(by='NET_MONEY_FLOW_CR', ascending=True)
-        bearish_display = bearish.head(top_n) if top_n is not None else bearish
-        bearish_display = bearish_display.copy()
-        bearish_display.rename(columns={'CHANGE_STR': 'Change %', 'VWAP_DIST_STR': 'VWAP Dist %', 'INST_SCORE': 'Inst. Score'}, inplace=True)
-        cols_bearish = ['CHART_URL', 'SECTOR', 'LTP (₹)', 'Change %', 'Net Money Flow', 'VWAP Dist %', 'Volume', 'Vol / 10D Vol', 'Inst. Score']
-        st.dataframe(bearish_display[cols_bearish], column_config=table_column_config, use_container_width=True, hide_index=True)
+        st.subheader(f"{label_prefix} Bearish Short Setups")
+        bearish = unique_symbols_df.sort_values(by='INST_SCORE', ascending=True)
+        if top_n is not None:
+            bearish = bearish.head(top_n)
+        bearish = bearish.copy()
+        bearish.rename(columns={'CHANGE_STR': 'Change %', 'VWAP_DIST_STR': 'VWAP Dist %', 'INST_SCORE': 'Inst. Score'}, inplace=True)
+        cols_bearish = ['CHART_URL', 'SECTOR', 'LTP (₹)', 'Change %', 'VWAP Dist %', 'Volume', 'Vol / 10D Vol', 'Order Flow', 'Inst. Score']
+        st.dataframe(
+            bearish[cols_bearish],
+            column_config=table_column_config,
+            use_container_width=True,
+            hide_index=True
+        )
 
     # =========================================================================
-    # 4. CUMULATIVE TOP 30 INSTITUTIONAL MONEY FLOW & 09:45 ORB LEADERBOARD
+    # NEW TABLE: CUMULATIVE TOP 30 BULLISH & BEARISH SESSION TRACKING & RANKING
     # =========================================================================
     st.markdown("---")
-    st.subheader("🏆 Cumulative Top 30 Institutional Money Flow & 09:45 ORB Leaderboard")
-    st.caption("Ranked via professional institutional net capital turnover (₹ Crores), 20-day high/low breakout zones, multi-period volume expansion, and 09:45 ORB breakouts.")
+    st.subheader("🏆 Cumulative Top 30 Bullish & Bearish Session Tracker & Multi-Factor Ranking Leaderboard")
+    st.caption("Tracks any stock that entered Top 30 Bullish or Bearish since market opening. Ranks using 20-day price zones, multi-period volume ratios (1D/5D/10D/20D), and 09:45 ORB break momentum for both bullish and bearish setups.")
 
-    curr_top30_bull = set(unique_symbols_df.sort_values(by='NET_MONEY_FLOW_CR', ascending=False).head(30)['SYMBOL'].tolist())
-    curr_top30_bear = set(unique_symbols_df.sort_values(by='NET_MONEY_FLOW_CR', ascending=True).head(30)['SYMBOL'].tolist())
+    curr_top30_bull = set(unique_symbols_df.sort_values(by='INST_SCORE', ascending=False).head(30)['SYMBOL'].tolist())
+    curr_top30_bear = set(unique_symbols_df.sort_values(by='INST_SCORE', ascending=True).head(30)['SYMBOL'].tolist())
     curr_combined_30 = curr_top30_bull.union(curr_top30_bear)
 
     if 'tracked_session_symbols' not in st.session_state:
@@ -470,13 +460,12 @@ def dashboard_live_loop():
             r = row_data.iloc[0]
             ltp = r['LTP (₹)']
             current_vol = r['VOLUME_RAW']
-            net_money_cr = r['NET_MONEY_FLOW_CR']
             instrument_key = mapped_df[mapped_df['SYMBOL'] == sym]['instrument_key'].values
             if len(instrument_key) == 0:
                 continue
             ikey = instrument_key[0]
             
-            # --- FACTOR 1: N-Day High/Low Price Zone Ranking (Up to 20 days) ---
+            # 1. Ranking by N-Day High/Low Price Zone (Up to 20 days)
             candles_20d = hist_20d_data.get(ikey, []) or hist_20d_data.get(ikey.replace('|', ':'), [])
             price_rank_score = 0
             days_high_hit = 0
@@ -493,7 +482,7 @@ def dashboard_live_loop():
                         days_high_hit = -day_lookback
                         price_rank_score = max(price_rank_score, day_lookback * 4)
 
-            # --- FACTOR 2: Multi-Period Volume Spikes ---
+            # 2. Ranking by Volume vs 1-day, 5-days, 10-days, and 20-days
             vol_multiplier_score = 0.0
             if len(candles_20d) >= 21:
                 vols_list = [c[5] for c in candles_20d[1:21]]
@@ -509,7 +498,7 @@ def dashboard_live_loop():
                 
                 vol_multiplier_score = (r_1d * 0.5) + (r_5d * 1.0) + (r_10d * 1.5) + (r_20d * 2.0)
 
-            # --- FACTOR 3: Fixed 09:45 Opening Range Break (ORB) Engine ---
+            # 3. 09:45 ORB Break, Momentum Maintenance, & Reversion Penalty Logic
             orb_status = "No Break"
             orb_score = 0.0
             intra_candles = intraday_data_map.get(ikey, []) or intraday_data_map.get(ikey.replace('|', ':'), [])
@@ -546,11 +535,11 @@ def dashboard_live_loop():
                             orb_status = "Bearish ORB Break (-)"
                             orb_score = 30.0
                         else:
-                            orb_status = "Inside ORB Range"
-                            orb_score = 0.0
+                            orb_status = "Returned to Range / Negative"
+                            orb_score = -15.0
 
-            # Professional Institutional Composite Score weighting Net Money Flow heavily
-            composite_rank_score = abs(net_money_cr) * 1.5 + price_rank_score + vol_multiplier_score + orb_score
+            # Unified Composite Score applied equally for both Bullish & Bearish
+            composite_rank_score = abs(r['INST_SCORE']) * 1.5 + price_rank_score + vol_multiplier_score + orb_score
 
             ranked_records.append({
                 'SYMBOL': sym,
@@ -559,16 +548,16 @@ def dashboard_live_loop():
                 'Bias': st.session_state['tracked_session_symbols'][sym],
                 'LTP (₹)': ltp,
                 'Change %': r['CHANGE_STR'],
-                'Net Money Flow': r['Net Money Flow'],
+                'Volume': r['Volume'],
                 '20D High/Low Zone': f"{days_high_hit:+d}D Zone" if days_high_hit != 0 else "Range Bound",
                 'Vol Multiplier': f"{vol_multiplier_score:.1f}pts",
-                'ORB 09:45 Status': orb_status,
-                'Session Institutional Score': round(composite_rank_score, 2)
+                '09:45 ORB Status': orb_status,
+                'Session Composite Rank Score': round(composite_rank_score, 2)
             })
 
         session_ranked_df = pd.DataFrame(ranked_records)
         if not session_ranked_df.empty:
-            session_ranked_df = session_ranked_df.sort_values(by='Session Institutional Score', ascending=False).reset_index(drop=True)
+            session_ranked_df = session_ranked_df.sort_values(by='Session Composite Rank Score', ascending=False).reset_index(drop=True)
             
             st.dataframe(
                 session_ranked_df,
@@ -577,6 +566,6 @@ def dashboard_live_loop():
                 hide_index=True
             )
     else:
-        st.info("Accumulating institutional leader stats for session ranking...")
+        st.info("Accumulating session-tracked leaders...")
 
 dashboard_live_loop()
