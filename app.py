@@ -103,7 +103,7 @@ def fetch_10d_avg_volumes_throttled(instrument_keys, access_token):
 
 @st.cache_data(ttl=3600)
 def fetch_historical_candles_20d(instrument_keys, access_token):
-    """Fetches 20 days of historical daily and intraday info for high/low & ORB scoring."""
+    """Fetches 20 days of historical daily info for high/low scoring."""
     today = datetime.now(IST)
     from_date = (today - timedelta(days=35)).strftime("%Y-%m-%d")
     to_date = today.strftime("%Y-%m-%d")
@@ -316,20 +316,17 @@ def dashboard_live_loop():
         quotes, api_error = fetch_live_quotes_safe(unique_keys, ACCESS_TOKEN)
         data_df = process_market_data(mapped_df, quotes, avg_10d_vols)
         
-        # Continuously hold the latest market data in memory
         if not data_df.empty:
             st.session_state['frozen_df'] = data_df
             st.session_state['frozen_time'] = now_str
             st.session_state['frozen_date'] = today_str
     else:
-        # Market is CLOSED (After 3:13 PM or Before 9:14 AM / Weekends)
         if 'frozen_df' in st.session_state and not st.session_state['frozen_df'].empty:
             data_df = st.session_state['frozen_df']
             frozen_at = st.session_state.get('frozen_time', '3:13:00 IST')
             st.warning(f"🔴 **MARKET CLOSED — FROZEN AT 3:13 PM IST** (Data locked at: {frozen_at})")
             api_error = None
         else:
-            # First load after 3:13 PM (fetch once to freeze final state)
             st.warning(f"🔴 **MARKET CLOSED** — Fetching final 3:13 PM market snapshot. Current time: {now_str}")
             quotes, api_error = fetch_live_quotes_safe(unique_keys, ACCESS_TOKEN)
             data_df = process_market_data(mapped_df, quotes, avg_10d_vols)
@@ -379,10 +376,8 @@ def dashboard_live_loop():
         )
     }
 
-    # --- Deduplicate Stocks for Leaders ---
     unique_symbols_df = data_df.drop_duplicates(subset=['SYMBOL'])
 
-    # --- Display Count Selection ---
     display_option = st.selectbox(
         "Select Number of Stocks to Display:",
         options=["Top 10", "Top 20", "All"],
@@ -403,36 +398,20 @@ def dashboard_live_loop():
     with col1:
         st.subheader(f"{label_prefix} Bullish Momentum Leaders")
         bullish = unique_symbols_df.sort_values(by='INST_SCORE', ascending=False)
-        if top_n is not None:
-            bullish_display = bullish.head(top_n)
-        else:
-            bullish_display = bullish
+        bullish_display = bullish.head(top_n) if top_n is not None else bullish
         bullish_display = bullish_display.copy()
         bullish_display.rename(columns={'CHANGE_STR': 'Change %', 'VWAP_DIST_STR': 'VWAP Dist %', 'INST_SCORE': 'Inst. Score'}, inplace=True)
         cols_bullish = ['CHART_URL', 'SECTOR', 'LTP (₹)', 'Change %', 'VWAP Dist %', 'Volume', 'Vol / 10D Vol', 'Order Flow', 'Inst. Score']
-        st.dataframe(
-            bullish_display[cols_bullish],
-            column_config=table_column_config,
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(bullish_display[cols_bullish], column_config=table_column_config, use_container_width=True, hide_index=True)
 
     with col2:
         st.subheader(f"{label_prefix} Bearish Short Setups")
         bearish = unique_symbols_df.sort_values(by='INST_SCORE', ascending=True)
-        if top_n is not None:
-            bearish_display = bearish.head(top_n)
-        else:
-            bearish_display = bearish
+        bearish_display = bearish.head(top_n) if top_n is not None else bearish
         bearish_display = bearish_display.copy()
         bearish_display.rename(columns={'CHANGE_STR': 'Change %', 'VWAP_DIST_STR': 'VWAP Dist %', 'INST_SCORE': 'Inst. Score'}, inplace=True)
         cols_bearish = ['CHART_URL', 'SECTOR', 'LTP (₹)', 'Change %', 'VWAP Dist %', 'Volume', 'Vol / 10D Vol', 'Order Flow', 'Inst. Score']
-        st.dataframe(
-            bearish_display[cols_bearish],
-            column_config=table_column_config,
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(bearish_display[cols_bearish], column_config=table_column_config, use_container_width=True, hide_index=True)
 
     # =========================================================================
     # 4. CUMULATIVE TOP 30 SESSION TRACKER & ADVANCED MULTI-FACTOR RANKING TABLE
@@ -441,25 +420,21 @@ def dashboard_live_loop():
     st.subheader("🏆 Cumulative Top 30 Multi-Factor Institutional Session Leaderboard")
     st.caption("Tracks all stocks that entered the top 30 Bullish or Bearish lists since market open. Ranked via 20-day high/low price zones, multi-period volume spikes, and 09:45 ORB break/momentum rules.")
 
-    # Identify current top 30 bullish and bearish symbols
     curr_top30_bull = set(unique_symbols_df.sort_values(by='INST_SCORE', ascending=False).head(30)['SYMBOL'].tolist())
     curr_top30_bear = set(unique_symbols_df.sort_values(by='INST_SCORE', ascending=True).head(30)['SYMBOL'].tolist())
     curr_combined_30 = curr_top30_bull.union(curr_top30_bear)
 
-    # Initialize persistent session tracked symbols dictionary in session state
     if 'tracked_session_symbols' not in st.session_state:
-        st.session_state['tracked_session_symbols'] = {} # symbol -> type ('BULLISH' / 'BEARISH')
+        st.session_state['tracked_session_symbols'] = {}
 
     for sym in curr_combined_30:
         if sym not in st.session_state['tracked_session_symbols']:
-            # Determine initial bias
             bias = 'BULLISH' if sym in curr_top30_bull else 'BEARISH'
             st.session_state['tracked_session_symbols'][sym] = bias
 
     tracked_symbols_list = list(st.session_state['tracked_session_symbols'].keys())
 
     if tracked_symbols_list:
-        # Fetch intraday candles for ORB assessment
         intraday_data_map = fetch_intraday_candles_today(unique_keys, ACCESS_TOKEN)
         
         ranked_records = []
@@ -480,12 +455,9 @@ def dashboard_live_loop():
             price_rank_score = 0
             days_high_hit = 0
             if len(candles_20d) >= 2:
-                # candles format from Upstox: [timestamp, open, high, low, close, volume, oi]
-                # Index 1 onwards represents historical daily candles
                 daily_highs = [c[2] for c in candles_20d[1:21]]
                 daily_lows = [c[3] for c in candles_20d[1:21]]
                 
-                # Check how many days high/low are broken or matched
                 for idx_d, (h_val, l_val) in enumerate(zip(daily_highs, daily_lows)):
                     day_lookback = idx_d + 1
                     if ltp >= h_val:
@@ -498,7 +470,7 @@ def dashboard_live_loop():
             # --- FACTOR 2: Multi-Period Volume Comparison (1D, 5D, 10D, 20D) ---
             vol_multiplier_score = 0.0
             if len(candles_20d) >= 21:
-                vols_list = [c[5] for c in candles_20d[1:21]] # past 20 days daily volumes
+                vols_list = [c[5] for c in candles_20d[1:21]]
                 vol_1d_avg = vols_list[0] if len(vols_list) > 0 else 1
                 vol_5d_avg = sum(vols_list[:5]) / 5 if len(vols_list) >= 5 else vol_1d_avg
                 vol_10d_avg = sum(vols_list[:10]) / 10 if len(vols_list) >= 10 else vol_5d_avg
@@ -511,49 +483,55 @@ def dashboard_live_loop():
                 
                 vol_multiplier_score = (r_1d * 1.0) + (r_5d * 1.5) + (r_10d * 2.0) + (r_20d * 2.5)
 
-            # --- FACTOR 3 & 4: 09:45 ORB Break, Momentum & Mean Reversion Penalty ---
+            # --- FACTOR 3 & 4: Corrected 09:45 ORB Break, Momentum & Reversion Penalty ---
             orb_status = "No Break"
             orb_score = 0.0
             intra_candles = intraday_data_map.get(ikey, []) or intraday_data_map.get(ikey.replace('|', ':'), [])
             if intra_candles:
-                # Filter candles up to 09:45 AM for opening range (09:15 to 09:45 -> 6 candles of 5 mins)
-                orb_high = 0.0
-                orb_low = 999999.0
-                has_945_formed = False
-                
+                opening_candles = []
                 for ic in intra_candles:
-                    # ic[0] is timestamp string or unix timestamp in ms
-                    dt_candle = datetime.fromtimestamp(ic[0]/1000, tz=IST) if isinstance(ic[0], (int, float)) else pd.to_datetime(ic[0])
-                    if hasattr(dt_candle, 'time') and dt_candle.time() <= datetime.strptime("09:45:00", "%H:%M:%S").time():
-                        orb_high = max(orb_high, ic[2])
-                        orb_low = min(orb_low, ic[3])
-                        has_945_formed = True
-
-                if has_945_formed and orb_high > 0:
-                    if ltp > orb_high:
-                        # Bullish ORB Break maintained
-                        mom_check = r['CHANGE_%']
-                        if mom_check > 0.5:
-                            orb_status = "Bullish ORB Break (+)"
-                            orb_score = 25.0
+                    try:
+                        if isinstance(ic[0], (int, float)):
+                            dt_candle = datetime.fromtimestamp(ic[0]/1000, tz=IST)
                         else:
-                            orb_status = "Bullish ORB Re-entry/Pullback (-)"
-                            orb_score = -15.0 # Penalty for coming back to ORB
-                    elif ltp < orb_low:
-                        # Bearish ORB Break maintained
-                        mom_check = r['CHANGE_%']
-                        if mom_check < -0.5:
-                            orb_status = "Bearish ORB Break (-)"
-                            orb_score = 25.0
-                        else:
-                            orb_status = "Bearish ORB Re-entry/Pullback (+)"
-                            orb_score = -15.0 # Penalty for coming back to ORB
-                    else:
-                        orb_status = "Inside ORB Range"
-                        orb_score = 0.0
+                            dt_candle = pd.to_datetime(ic[0])
+                            if dt_candle.tzinfo is None:
+                                dt_candle = dt_candle.tz_localize(IST)
+                            else:
+                                dt_candle = dt_candle.tz_convert(IST)
+                        
+                        if dt_candle.strftime("%Y-%m-%d") == today_str:
+                            t_val = dt_candle.time()
+                            if datetime.strptime("09:15:00", "%H:%M:%S").time() <= t_val <= datetime.strptime("09:45:00", "%H:%M:%S").time():
+                                opening_candles.append(ic)
+                    except Exception:
+                        continue
 
-            # Combined Multi-Factor Composite Session Score
-            # Works symmetrically for both Bullish & Bearish (higher score means stronger conviction in its respective direction)
+                if opening_candles:
+                    orb_high = max(c[2] for c in opening_candles)
+                    orb_low = min(c[3] for c in opening_candles)
+                    
+                    if orb_high > 0 and orb_low < 999999:
+                        if ltp > orb_high:
+                            mom_check = r['CHANGE_%']
+                            if mom_check > 0.5:
+                                orb_status = "Bullish ORB Break (+)"
+                                orb_score = 25.0
+                            else:
+                                orb_status = "Bullish ORB Re-entry/Pullback (-)"
+                                orb_score = -15.0
+                        elif ltp < orb_low:
+                            mom_check = r['CHANGE_%']
+                            if mom_check < -0.5:
+                                orb_status = "Bearish ORB Break (-)"
+                                orb_score = 25.0
+                            else:
+                                orb_status = "Bearish ORB Re-entry/Pullback (+)"
+                                orb_score = -15.0
+                        else:
+                            orb_status = "Inside ORB Range"
+                            orb_score = 0.0
+
             base_bias_score = abs(r['INST_SCORE'])
             composite_rank_score = base_bias_score + price_rank_score + vol_multiplier_score + orb_score
 
