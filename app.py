@@ -28,7 +28,7 @@ INSTRUMENTS_CSV_PATH = os.path.join(BASE_DIR, "instruments.csv")
 # ACCESS_TOKEN = "YOUR_UPSTOX_ACCESS_TOKEN"
 ACCESS_TOKEN = st.secrets.get("ACCESS_TOKEN", "")
 
-REFRESH_INTERVAL_SECONDS = 30
+REFRESH_INTERVAL_SECONDS = 60
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
