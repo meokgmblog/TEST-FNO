@@ -1551,6 +1551,425 @@ def calculate_volume_rank(
 
 # ==========================================================
 # NEW ADDITION
+# OPTIONS OI BUILDING + PCR + PCR OI CHANGE
+# ==========================================================
+def _fetch_single_option_chain_oi_pcr(
+    symbol,
+    underlying_key,
+    access_token
+):
+    """
+    Fetch the current-month option chain for one F&O stock.
+
+    One Upstox option-chain request gives current OI and previous
+    OI for both CE and PE across strikes. We use that single
+    response to calculate:
+      - Total CE OI / PE OI
+      - Total OI change
+      - Directional option-OI build bias
+      - Current PCR
+      - Previous-OI PCR
+      - PCR change derived from OI
+
+    This deliberately uses the option-chain API rather than making
+    three separate OI/PCR API calls for every stock, which keeps the
+    live dashboard much lighter on API requests.
+    """
+
+    if not underlying_key:
+        return symbol, {
+            'oi_status': 'NO INSTRUMENT KEY'
+        }
+
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {access_token}'
+    }
+
+    url = 'https://api.upstox.com/v2/option/chain'
+
+    params = {
+        'instrument_key': underlying_key,
+        'expiry_date': 'current_month'
+    }
+
+    for attempt in range(2):
+
+        try:
+
+            res = requests.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=8
+            )
+
+            if res.status_code == 200:
+
+                payload = res.json()
+
+                if payload.get('status') != 'success':
+                    return symbol, {
+                        'oi_status': 'API UNSUCCESSFUL'
+                    }
+
+                chain = payload.get('data', []) or []
+
+                if not chain:
+                    return symbol, {
+                        'oi_status': 'NO OPTION DATA'
+                    }
+
+                total_call_oi = 0.0
+                total_put_oi = 0.0
+                total_call_prev_oi = 0.0
+                total_put_prev_oi = 0.0
+
+                for item in chain:
+
+                    call_md = (
+                        (item.get('call_options') or {})
+                        .get('market_data') or {}
+                    )
+
+                    put_md = (
+                        (item.get('put_options') or {})
+                        .get('market_data') or {}
+                    )
+
+                    total_call_oi += safe_float(
+                        call_md.get('oi')
+                    )
+
+                    total_put_oi += safe_float(
+                        put_md.get('oi')
+                    )
+
+                    total_call_prev_oi += safe_float(
+                        call_md.get('prev_oi')
+                    )
+
+                    total_put_prev_oi += safe_float(
+                        put_md.get('prev_oi')
+                    )
+
+                total_current_oi = (
+                    total_call_oi
+                    + total_put_oi
+                )
+
+                total_previous_oi = (
+                    total_call_prev_oi
+                    + total_put_prev_oi
+                )
+
+                call_oi_change = (
+                    total_call_oi
+                    - total_call_prev_oi
+                )
+
+                put_oi_change = (
+                    total_put_oi
+                    - total_put_prev_oi
+                )
+
+                total_oi_change = (
+                    total_current_oi
+                    - total_previous_oi
+                )
+
+                current_pcr = (
+                    total_put_oi / total_call_oi
+                    if total_call_oi > 0
+                    else 0.0
+                )
+
+                previous_pcr = (
+                    total_put_prev_oi
+                    / total_call_prev_oi
+                    if total_call_prev_oi > 0
+                    else 0.0
+                )
+
+                pcr_oi_change_pct = (
+                    (
+                        (current_pcr - previous_pcr)
+                        / previous_pcr
+                    ) * 100
+                    if previous_pcr > 0
+                    else 0.0
+                )
+
+                # Positive bias = PE OI is building more than CE OI.
+                # Negative bias = CE OI is building more than PE OI.
+                directional_oi_change = (
+                    put_oi_change
+                    - call_oi_change
+                )
+
+                denominator = max(
+                    total_previous_oi,
+                    1.0
+                )
+
+                oi_bias_pct = (
+                    directional_oi_change
+                    / denominator
+                ) * 100
+
+                # This is a sentiment-oriented options OI build label.
+                if directional_oi_change > 0:
+                    oi_build = 'BULLISH OI BUILD'
+                elif directional_oi_change < 0:
+                    oi_build = 'BEARISH OI BUILD'
+                elif total_oi_change > 0:
+                    oi_build = 'MIXED OI BUILD'
+                elif total_oi_change < 0:
+                    oi_build = 'OI UNWINDING'
+                else:
+                    oi_build = 'OI FLAT'
+
+                return symbol, {
+                    'oi_status': 'OK',
+                    'expiry': chain[0].get('expiry', ''),
+                    'call_oi': total_call_oi,
+                    'put_oi': total_put_oi,
+                    'call_oi_change': call_oi_change,
+                    'put_oi_change': put_oi_change,
+                    'total_oi': total_current_oi,
+                    'total_oi_change': total_oi_change,
+                    'current_pcr': current_pcr,
+                    'previous_pcr': previous_pcr,
+                    'pcr_oi_change_pct': pcr_oi_change_pct,
+                    'oi_bias_pct': oi_bias_pct,
+                    'oi_build': oi_build
+                }
+
+            elif res.status_code == 429:
+
+                time.sleep(0.5)
+
+            else:
+
+                if attempt == 0:
+                    time.sleep(0.25)
+                else:
+                    return symbol, {
+                        'oi_status': f'HTTP {res.status_code}'
+                    }
+
+        except Exception as exc:
+
+            if attempt == 0:
+                time.sleep(0.25)
+            else:
+                return symbol, {
+                    'oi_status': f'ERROR: {str(exc)[:60]}'
+                }
+
+    return symbol, {
+        'oi_status': 'NO DATA'
+    }
+
+
+@st.cache_data(
+    ttl=25,
+    show_spinner=False
+)
+def fetch_options_oi_pcr_cached(
+    symbol_to_key_items,
+    symbols,
+    access_token,
+    today_str
+):
+    """
+    Fetch option-chain OI/PCR data for retained candidates.
+
+    Cache is intentionally short so the OI/PCR section follows the
+    live 30-second dashboard refresh without creating unnecessary
+    duplicate API calls.
+    """
+
+    symbol_to_key = dict(symbol_to_key_items)
+    results = {}
+
+    with ThreadPoolExecutor(
+        max_workers=4
+    ) as executor:
+
+        future_to_symbol = {}
+
+        for symbol in symbols:
+
+            key = symbol_to_key.get(
+                symbol,
+                ''
+            )
+
+            if key:
+
+                future = executor.submit(
+                    _fetch_single_option_chain_oi_pcr,
+                    symbol,
+                    key,
+                    access_token
+                )
+
+                future_to_symbol[
+                    future
+                ] = symbol
+
+        for future in as_completed(
+            future_to_symbol
+        ):
+
+            symbol = future_to_symbol[
+                future
+            ]
+
+            try:
+                _, result = future.result()
+                results[symbol] = result
+            except Exception:
+                results[symbol] = {
+                    'oi_status': 'FETCH ERROR'
+                }
+
+    # Ensure every requested symbol has an entry.
+    for symbol in symbols:
+        if symbol not in results:
+            results[symbol] = {
+                'oi_status': 'NO DATA'
+            }
+
+    return results
+
+
+def calculate_oi_build_rank(
+    direction,
+    oi_bias_pct,
+    price_change_pct,
+    total_oi_change
+):
+    """
+    Direction-aware OI building rank, 0-5.
+
+    Positive PE-vs-CE OI bias supports bullish candidates.
+    Negative PE-vs-CE OI bias supports bearish candidates.
+
+    The underlying price is also used as a confirmation signal:
+      Bullish: price up + bullish OI bias = stronger confirmation.
+      Bearish: price down + bearish OI bias = stronger confirmation.
+
+    This is an options-OI sentiment rank, not a claim that option
+    OI alone identifies whether a participant is buyer or writer.
+    """
+
+    bias = safe_float(oi_bias_pct)
+    price = safe_float(price_change_pct)
+    oi_change = safe_float(total_oi_change)
+
+    if direction == 'BULLISH':
+        aligned = bias > 0
+        price_aligned = price > 0
+    else:
+        aligned = bias < 0
+        price_aligned = price < 0
+
+    if not aligned:
+        return 0, 'AGAINST DIRECTION'
+
+    magnitude = min(
+        abs(bias),
+        5.0
+    )
+
+    score = min(
+        4,
+        max(1, int(magnitude + 0.5))
+    )
+
+    if price_aligned and oi_change > 0:
+        score += 1
+        label = 'STRONG BUILD'
+    elif price_aligned:
+        label = 'BUILD'
+    elif oi_change > 0:
+        label = 'OI BUILD'
+    else:
+        label = 'WEAK BUILD'
+
+    return min(score, 5), label
+
+
+def calculate_pcr_rank(
+    direction,
+    pcr
+):
+    """
+    Direction-aware PCR rank, 0-5.
+
+    Bullish candidates are favored when PCR is above 1.
+    Bearish candidates are favored when PCR is below 1.
+    The farther PCR moves from 1 in the candidate's direction,
+    the higher the rank.
+    """
+
+    pcr = safe_float(pcr)
+
+    if pcr <= 0:
+        return 0
+
+    if direction == 'BULLISH':
+        edge = pcr - 1.0
+    else:
+        edge = 1.0 - pcr
+
+    if edge <= 0:
+        return 0
+
+    score = min(
+        5,
+        max(1, int(edge * 10))
+    )
+
+    return score
+
+
+def calculate_pcr_oi_change_rank(
+    direction,
+    pcr_oi_change_pct
+):
+    """
+    Direction-aware rank for change in PCR calculated directly
+    from current OI versus previous OI.
+
+    Bullish: rising PCR is supportive.
+    Bearish: falling PCR is supportive.
+    """
+
+    change_pct = safe_float(
+        pcr_oi_change_pct
+    )
+
+    if direction == 'BULLISH':
+        edge = change_pct
+    else:
+        edge = -change_pct
+
+    if edge <= 0:
+        return 0
+
+    score = min(
+        5,
+        max(1, int(edge / 2))
+    )
+
+    return score
+
+
+# ==========================================================
+# NEW ADDITION
 # BUILD COMBINED RANKING
 # ==========================================================
 def build_combined_rank_table(
@@ -1558,7 +1977,8 @@ def build_combined_rank_table(
     data_df,
     mapped_df,
     daily_history,
-    orb_data
+    orb_data,
+    options_oi_data
 ):
     if not candidate_state:
         return pd.DataFrame()
@@ -1647,10 +2067,65 @@ def build_combined_rank_table(
             )
         )
 
+        oi_data = options_oi_data.get(
+            symbol,
+            {
+                'oi_status': 'NO DATA'
+            }
+        )
+
+        oi_bias_pct = safe_float(
+            oi_data.get(
+                'oi_bias_pct'
+            )
+        )
+
+        total_oi_change = safe_float(
+            oi_data.get(
+                'total_oi_change'
+            )
+        )
+
+        pcr = safe_float(
+            oi_data.get(
+                'current_pcr'
+            )
+        )
+
+        pcr_oi_change_pct = safe_float(
+            oi_data.get(
+                'pcr_oi_change_pct'
+            )
+        )
+
+        oi_build_rank, oi_build_label = (
+            calculate_oi_build_rank(
+                direction,
+                oi_bias_pct,
+                safe_float(row.get('CHANGE_%')),
+                total_oi_change
+            )
+        )
+
+        pcr_rank = calculate_pcr_rank(
+            direction,
+            pcr
+        )
+
+        pcr_oi_change_rank = (
+            calculate_pcr_oi_change_rank(
+                direction,
+                pcr_oi_change_pct
+            )
+        )
+
         total_score = (
             price_score
             + volume_score
             + orb_score
+            + oi_build_rank
+            + pcr_rank
+            + pcr_oi_change_rank
         )
 
         rows.append({
@@ -1712,6 +2187,32 @@ def build_combined_rank_table(
                 'NO DATA'
             ),
             'ORB Score': orb_score,
+            'OI Build': oi_data.get(
+                'oi_build',
+                'NO DATA'
+            ),
+            'OI Build Rank': oi_build_rank,
+            'PCR': (
+                round(pcr, 2)
+                if pcr > 0
+                else '-'
+            ),
+            'PCR Rank': pcr_rank,
+            'PCR OI Chg %': (
+                round(pcr_oi_change_pct, 2)
+                if oi_data.get('oi_status') == 'OK'
+                else '-'
+            ),
+            'PCR OI Chg Rank': pcr_oi_change_rank,
+            'OI Chg': (
+                round(total_oi_change, 0)
+                if oi_data.get('oi_status') == 'OK'
+                else '-'
+            ),
+            'OI Status': oi_data.get(
+                'oi_status',
+                'NO DATA'
+            ),
             'Total Rank Score': total_score,
             'Entered Top-30 At': candidate.get(
                 'entered_at',
@@ -1729,9 +2230,17 @@ def build_combined_rank_table(
             'Total Rank Score',
             'Price Rank',
             'Volume Rank',
+            'OI Build Rank',
+            'PCR Rank',
+            'PCR OI Chg Rank',
+            'ORB Score',
             'Inst. Score'
         ],
         ascending=[
+            False,
+            False,
+            False,
+            False,
             False,
             False,
             False,
@@ -2476,6 +2985,18 @@ def dashboard_live_loop():
     )
 
     # ==========================================
+    # NEW OPTIONS OI + PCR DATA
+    # ==========================================
+    options_oi_data = (
+        fetch_options_oi_pcr_cached(
+            tuple(sorted(symbol_to_key.items())),
+            tuple(sorted(retained_symbols)),
+            ACCESS_TOKEN,
+            today_str
+        )
+    )
+
+    # ==========================================
     # BUILD COMBINED RANKING
     # ==========================================
     combined_rank_df = (
@@ -2484,7 +3005,8 @@ def dashboard_live_loop():
             data_df,
             mapped_df,
             daily_history,
-            orb_data
+            orb_data,
+            options_oi_data
         )
     )
 
@@ -2529,14 +3051,17 @@ def dashboard_live_loop():
         )
 
         st.caption(
-            "Ranking = Price Rank + Volume Rank + ORB Score. "
+            "Ranking = Price + Volume + ORB + OI Build + PCR + PCR OI Change. "
             "Price: 1D/2D/5D/10D/20D high for bullish "
             "and corresponding low for bearish. "
             "Volume: current cumulative volume versus "
             "previous 1D/5D/10D/20D volume. "
-            "ORB = 09:15–09:45. "
-            "ORB breakout = +3; maintained momentum = +5 total; "
-            "return inside ORB after a breakout = -3."
+            "ORB = 09:15–09:45; breakout = +3, maintained momentum = +5 total, "
+            "return inside ORB = -3. "
+            "OI Build uses current-month option OI versus previous OI. "
+            "PCR = total PE OI / total CE OI. "
+            "PCR OI Chg % = change in PCR calculated from current versus previous OI. "
+            "Each OI/PCR component contributes a direction-aware rank from 0 to 5."
         )
 
 
