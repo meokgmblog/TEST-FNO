@@ -522,6 +522,7 @@ def process_market_data(
 
 
 # ==========================================================
+# NEW ADDITION
 # 20-DAY DAILY PRICE + VOLUME HISTORY
 # ==========================================================
 def _fetch_single_daily_history(
@@ -618,6 +619,8 @@ def fetch_20d_daily_history(
 ):
     today = datetime.now(IST)
 
+    # Previous completed day through approximately
+    # 20 previous trading sessions.
     from_date = (
         today - timedelta(days=35)
     ).strftime("%Y-%m-%d")
@@ -669,12 +672,24 @@ def fetch_20d_daily_history(
 
 
 # ==========================================================
+# NEW ADDITION
 # TODAY'S 09:15–09:45 ORB
 # ==========================================================
 def _fetch_today_5m_candles(
     key,
     access_token
 ):
+    """
+    Fetch CURRENT DAY 5-minute candles.
+
+    Important:
+    The previous version used the standard historical-candle
+    endpoint with today's date. For a live ORB, use Upstox V3
+    Intraday Candle API instead. The V3 intraday endpoint is
+    specifically designed to return the current trading day's
+    candles.
+    """
+
     headers = {
         'Accept': 'application/json',
         'Authorization': f'Bearer {access_token}'
@@ -685,6 +700,8 @@ def _fetch_today_5m_candles(
         safe='|:'
     )
 
+    # Upstox V3 current-day intraday endpoint.
+    # 5-minute candles are requested directly.
     url = (
         f"https://api.upstox.com/v3/historical-candle/"
         f"intraday/{encoded_key}/minutes/5"
@@ -762,6 +779,7 @@ def _fetch_today_5m_candles(
 
             else:
 
+                # Retry once for transient API failures.
                 if attempt == 0:
                     time.sleep(0.25)
 
@@ -783,6 +801,28 @@ def fetch_orb_data_for_symbols_cached(
     access_token,
     today_str
 ):
+    """
+    Build today's 09:15–09:45 ORB from Upstox V3
+    current-day 5-minute candles.
+
+    ORB range:
+        09:15
+        09:20
+        09:25
+        09:30
+        09:35
+        09:40
+
+    Breakout evaluation starts AFTER 09:45.
+
+    Scoring:
+        +3  ORB breakout
+        +5  ORB breakout + maintained momentum
+        -3  Breakout happened but price returned
+            back inside the ORB range
+         0  Still inside ORB / no breakout
+    """
+
     symbol_to_key = dict(
         symbol_to_key_items
     )
@@ -791,6 +831,8 @@ def fetch_orb_data_for_symbols_cached(
 
     now = datetime.now(IST)
 
+    # Before the ORB is complete, do not call the
+    # intraday API unnecessarily.
     if (
         now.hour < 9
         or (
@@ -810,6 +852,9 @@ def fetch_orb_data_for_symbols_cached(
 
         return results
 
+    # ------------------------------------------------------
+    # Fetch current-day candles.
+    # ------------------------------------------------------
     fetched = {}
 
     with ThreadPoolExecutor(
@@ -856,6 +901,9 @@ def fetch_orb_data_for_symbols_cached(
 
                 fetched[symbol] = []
 
+    # ------------------------------------------------------
+    # Calculate ORB independently for each stock.
+    # ------------------------------------------------------
     for symbol in symbols:
 
         candles = fetched.get(
@@ -929,6 +977,7 @@ def fetch_orb_data_for_symbols_cached(
             drop=True
         )
 
+        # Only today's candles.
         df = df[
             df['timestamp'].dt.strftime(
                 "%Y-%m-%d"
@@ -946,6 +995,10 @@ def fetch_orb_data_for_symbols_cached(
 
             continue
 
+        # --------------------------------------------------
+        # 09:15 through 09:40 = six 5-minute candles.
+        # The 09:45 candle is NOT part of the ORB range.
+        # --------------------------------------------------
         orb_df = df[
             (
                 df['timestamp'].dt.hour == 9
@@ -960,6 +1013,8 @@ def fetch_orb_data_for_symbols_cached(
             )
         ].copy()
 
+        # Require at least one candle. Normally six should
+        # exist after 09:45.
         if orb_df.empty:
 
             results[symbol] = {
@@ -994,6 +1049,9 @@ def fetch_orb_data_for_symbols_cached(
 
             continue
 
+        # --------------------------------------------------
+        # Only candles AFTER 09:45 can be breakout candles.
+        # --------------------------------------------------
         after_orb = df[
             (
                 df['timestamp'].dt.hour > 9
@@ -1021,6 +1079,15 @@ def fetch_orb_data_for_symbols_cached(
 
             continue
 
+        # --------------------------------------------------
+        # Detect actual breakout events using CLOSE.
+        #
+        # Bull breakout:
+        #   close > ORB high
+        #
+        # Bear breakout:
+        #   close < ORB low
+        # --------------------------------------------------
         bull_breaks = (
             after_orb['close']
             > orb_high
@@ -1043,6 +1110,10 @@ def fetch_orb_data_for_symbols_cached(
             after_orb.iloc[-1]['close']
         )
 
+        # --------------------------------------------------
+        # If both sides broke at different times, evaluate
+        # the most recent breakout direction.
+        # --------------------------------------------------
         latest_bull_time = (
             after_orb.loc[
                 bull_breaks,
@@ -1104,6 +1175,9 @@ def fetch_orb_data_for_symbols_cached(
             last_break_direction = None
             last_break_time = None
 
+        # --------------------------------------------------
+        # No breakout yet.
+        # --------------------------------------------------
         if last_break_direction is None:
 
             results[symbol] = {
@@ -1115,6 +1189,7 @@ def fetch_orb_data_for_symbols_cached(
 
             continue
 
+        # Candles from the latest breakout onward.
         post_break = after_orb[
             after_orb['timestamp']
             >= last_break_time
@@ -1123,10 +1198,16 @@ def fetch_orb_data_for_symbols_cached(
         if post_break.empty:
             post_break = after_orb.tail(1)
 
+        # --------------------------------------------------
+        # Bullish breakout.
+        # --------------------------------------------------
         if last_break_direction == 'BULLISH':
 
             if latest_close > orb_high:
 
+                # Every candle after the latest breakout
+                # must remain above ORB high for the
+                # stronger momentum score.
                 maintained = bool(
                     (
                         post_break['close']
@@ -1150,15 +1231,23 @@ def fetch_orb_data_for_symbols_cached(
 
             else:
 
+                # It broke above ORB and subsequently
+                # returned inside/below the ORB.
                 status = (
                     'BULL ORB RETURN / NEGATIVE'
                 )
                 score = -3
 
+        # --------------------------------------------------
+        # Bearish breakout.
+        # --------------------------------------------------
         else:
 
             if latest_close < orb_low:
 
+                # Every candle after the latest breakout
+                # must remain below ORB low for the
+                # stronger momentum score.
                 maintained = bool(
                     (
                         post_break['close']
@@ -1182,6 +1271,8 @@ def fetch_orb_data_for_symbols_cached(
 
             else:
 
+                # It broke below ORB and subsequently
+                # returned inside/above the ORB.
                 status = (
                     'BEAR ORB RETURN / NEGATIVE'
                 )
@@ -1204,6 +1295,7 @@ def fetch_orb_data_for_symbols_cached(
 
 
 # ==========================================================
+# NEW ADDITION
 # PRICE RANK
 # ==========================================================
 def get_history_for_symbol(
@@ -1242,6 +1334,22 @@ def calculate_price_rank(
     history,
     direction
 ):
+    """
+    Bullish:
+        1D high -> 1 point
+        2D high -> 2 points
+        5D high -> 3 points
+        10D high -> 4 points
+        20D high -> 5 points
+
+    Bearish:
+        1D low -> 1 point
+        2D low -> 2 points
+        5D low -> 3 points
+        10D low -> 4 points
+        20D low -> 5 points
+    """
+
     if (
         ltp <= 0
         or not history
@@ -1305,12 +1413,23 @@ def calculate_price_rank(
 
 
 # ==========================================================
+# NEW ADDITION
 # VOLUME RANK
 # ==========================================================
 def calculate_volume_rank(
     current_volume,
     history
 ):
+    """
+    Current cumulative market volume compared with:
+      1 previous trading day
+      5-day average
+      10-day average
+      20-day average
+
+    Same ranking is applied to bullish and bearish stocks.
+    """
+
     if (
         current_volume <= 0
         or not history
@@ -1431,87 +1550,7 @@ def calculate_volume_rank(
 
 
 # ==========================================================
-# NEW ADDITION: OI BUILDING, PCR & PCR OI CHANGE RANKS
-# ==========================================================
-def calculate_oi_building_rank(row, direction):
-    """
-    Computes Open Interest (OI) Building score & label (0 to 5)
-    based on order flow and volume expansion relative to direction.
-    """
-    flow_ratio = safe_float(row.get('FLOW_RATIO_RAW', 1.0))
-    vol_ratio = safe_float(row.get('VOL_10D_RATIO_RAW', 1.0))
-    
-    if direction == "BULLISH":
-        if flow_ratio >= 1.5 and vol_ratio >= 1.5:
-            return 5, "Strong Long Buildup"
-        elif flow_ratio >= 1.2 or vol_ratio >= 1.2:
-            return 3, "Moderate Long Buildup"
-        elif flow_ratio < 0.9:
-            return 1, "Long Unwinding"
-        return 2, "Neutral OI"
-    else:
-        if flow_ratio <= 0.7 and vol_ratio >= 1.5:
-            return 5, "Strong Short Buildup"
-        elif flow_ratio <= 0.85 or vol_ratio >= 1.2:
-            return 3, "Moderate Short Buildup"
-        elif flow_ratio > 1.1:
-            return 1, "Short Covering"
-        return 2, "Neutral OI"
-
-
-def calculate_pcr_rank(row, direction):
-    """
-    Computes PCR (Put-Call Ratio) score & value based on buy/sell order flow proxy.
-    Bullish preference: Healthy/rising put support (PCR ~ 0.9 to 1.3).
-    Bearish preference: Low call resistance / heavy put writing shifts.
-    """
-    flow_ratio = safe_float(row.get('FLOW_RATIO_RAW', 1.0))
-    # Synthetic/Proxy PCR derived from order flow distribution
-    pcr_val = round(max(0.4, min(2.5, 1.0 / flow_ratio if flow_ratio > 0 else 1.0)), 2)
-    
-    if direction == "BULLISH":
-        if 0.9 <= pcr_val <= 1.4:
-            return 5, pcr_val, "Optimal Bull PCR"
-        elif pcr_val < 0.9:
-            return 3, pcr_val, "Low PCR (Call Heavy)"
-        else:
-            return 2, pcr_val, "High PCR"
-    else:
-        if pcr_val > 1.2:
-            return 5, pcr_val, "High PCR (Put Heavy/Resistance)"
-        elif pcr_val < 0.8:
-            return 3, pcr_val, "Falling PCR"
-        else:
-            return 2, pcr_val, "Neutral PCR"
-
-
-def calculate_pcr_oi_change_rank(row, direction):
-    """
-    Computes PCR OI Change score & momentum status.
-    """
-    vol_ratio = safe_float(row.get('VOL_10D_RATIO_RAW', 1.0))
-    change_pct = safe_float(row.get('CHANGE_%', 0.0))
-    
-    # Proxy change score based on momentum & volume expansion
-    change_score = round(change_pct * vol_ratio * 0.5, 2)
-    
-    if direction == "BULLISH":
-        if change_score >= 1.5:
-            return 5, "+PCR OI Surge"
-        elif change_score > 0:
-            return 3, "+PCR OI Rise"
-        else:
-            return 1, "Declining PCR OI"
-    else:
-        if change_score <= -1.5:
-            return 5, "-PCR OI Surge"
-        elif change_score < 0:
-            return 3, "-PCR OI Drop"
-        else:
-            return 1, "Rising PCR OI"
-
-
-# ==========================================================
+# NEW ADDITION
 # BUILD COMBINED RANKING
 # ==========================================================
 def build_combined_rank_table(
@@ -1591,11 +1630,6 @@ def build_combined_rank_table(
             )
         )
 
-        # NEW ADDITIONS: OI Building, PCR, and PCR OI Change
-        oi_score, oi_label = calculate_oi_building_rank(row, direction)
-        pcr_score, pcr_val, pcr_label = calculate_pcr_rank(row, direction)
-        pcr_oi_score, pcr_oi_label = calculate_pcr_oi_change_rank(row, direction)
-
         orb = orb_data.get(
             symbol,
             {
@@ -1617,9 +1651,6 @@ def build_combined_rank_table(
             price_score
             + volume_score
             + orb_score
-            + oi_score
-            + pcr_score
-            + pcr_oi_score
         )
 
         rows.append({
@@ -1645,13 +1676,41 @@ def build_combined_rank_table(
                 )
             ),
             'Price Rank': price_score,
+            'Price Level': price_level,
             'Volume Rank': volume_score,
-            'OI Rank': oi_score,
-            'OI Status': oi_label,
-            'PCR': pcr_val,
-            'PCR Rank': pcr_score,
-            'PCR OI Change': pcr_oi_label,
-            'PCR OI Rank': pcr_oi_score,
+            'Volume Level': volume_level,
+            'ORB High': (
+                round(
+                    orb.get(
+                        'orb_high',
+                        0.0
+                    ),
+                    2
+                )
+                if orb.get(
+                    'orb_high',
+                    0.0
+                )
+                else "-"
+            ),
+            'ORB Low': (
+                round(
+                    orb.get(
+                        'orb_low',
+                        0.0
+                    ),
+                    2
+                )
+                if orb.get(
+                    'orb_low',
+                    0.0
+                )
+                else "-"
+            ),
+            'ORB Status': orb.get(
+                'orb_status',
+                'NO DATA'
+            ),
             'ORB Score': orb_score,
             'Total Rank Score': total_score,
             'Entered Top-30 At': candidate.get(
@@ -1670,11 +1729,9 @@ def build_combined_rank_table(
             'Total Rank Score',
             'Price Rank',
             'Volume Rank',
-            'OI Rank',
             'Inst. Score'
         ],
         ascending=[
-            False,
             False,
             False,
             False,
@@ -1763,6 +1820,8 @@ with st.spinner(
         )
     )
 
+    # NEW:
+    # Previous 20 completed trading sessions.
     daily_history = (
         fetch_20d_daily_history(
             unique_keys,
@@ -1772,7 +1831,7 @@ with st.spinner(
 
 
 # ==========================================
-# SYMBOL -> INSTRUMENT KEY
+# NEW: SYMBOL -> INSTRUMENT KEY
 # ==========================================
 symbol_to_key = dict(
     zip(
@@ -1783,7 +1842,7 @@ symbol_to_key = dict(
 
 
 # ==========================================
-# DAY-LEVEL CANDIDATE MEMORY
+# NEW: DAY-LEVEL CANDIDATE MEMORY
 # ==========================================
 if (
     'opening_top30_candidates'
@@ -1832,6 +1891,9 @@ def dashboard_live_loop():
         "%Y-%m-%d"
     )
 
+    # ==========================================
+    # RESET DAY MEMORY
+    # ==========================================
     if (
         st.session_state.get(
             'candidate_date'
@@ -1862,6 +1924,7 @@ def dashboard_live_loop():
             None
         )
 
+    # Reset cache if a new trading day starts
     if (
         'frozen_date'
         in st.session_state
@@ -1907,6 +1970,7 @@ def dashboard_live_loop():
             avg_10d_vols
         )
 
+        # Existing frozen/latest data behavior
         if not data_df.empty:
 
             st.session_state[
@@ -2011,6 +2075,7 @@ def dashboard_live_loop():
 
     # ==========================================
     # SECTOR SUMMARY TABLE
+    # EXISTING LOGIC
     # ==========================================
     st.subheader(
         "Sector Performance Breakdown"
@@ -2114,6 +2179,7 @@ def dashboard_live_loop():
 
     # ==========================================
     # TRADINGVIEW CONFIG
+    # EXISTING LOGIC
     # ==========================================
     table_column_config = {
 
@@ -2130,12 +2196,20 @@ def dashboard_live_loop():
 
     }
 
+    # ==========================================
+    # DEDUPLICATE
+    # EXISTING LOGIC
+    # ==========================================
     unique_symbols_df = (
         data_df.drop_duplicates(
             subset=['SYMBOL']
         )
     )
 
+    # ==========================================
+    # DISPLAY COUNT
+    # EXISTING LOGIC
+    # ==========================================
     display_option = st.selectbox(
         "Select Number of Stocks to Display:",
         options=[
@@ -2163,6 +2237,9 @@ def dashboard_live_loop():
 
     col1, col2 = st.columns(2)
 
+    # ==========================================
+    # EXISTING BULLISH TABLE
+    # ==========================================
     with col1:
 
         st.subheader(
@@ -2218,6 +2295,9 @@ def dashboard_live_loop():
             hide_index=True
         )
 
+    # ==========================================
+    # EXISTING BEARISH TABLE
+    # ==========================================
     with col2:
 
         st.subheader(
@@ -2274,7 +2354,8 @@ def dashboard_live_loop():
         )
 
     # ======================================================
-    # OPENING TOP-30 COMBINED RANKING (UPDATED WITH OI, PCR, & PCR OI CHANGE)
+    # NEW TABLE
+    # OPENING TOP-30 COMBINED RANKING
     # ======================================================
     st.divider()
 
@@ -2288,6 +2369,9 @@ def dashboard_live_loop():
         "for this table even if it later leaves Top-30."
     )
 
+    # ==========================================
+    # CURRENT TOP 30 BULLISH
+    # ==========================================
     current_bullish_top30 = (
         unique_symbols_df
         .sort_values(
@@ -2297,6 +2381,9 @@ def dashboard_live_loop():
         .head(30)
     )
 
+    # ==========================================
+    # CURRENT TOP 30 BEARISH
+    # ==========================================
     current_bearish_top30 = (
         unique_symbols_df
         .sort_values(
@@ -2312,6 +2399,9 @@ def dashboard_live_loop():
         ]
     )
 
+    # ==========================================
+    # RETAIN EVERY BULLISH TOP-30 ENTRY
+    # ==========================================
     for _, candidate in (
         current_bullish_top30.iterrows()
     ):
@@ -2331,12 +2421,17 @@ def dashboard_live_loop():
 
         else:
 
+            # If it appears in bullish Top-30 now,
+            # keep/update its current direction.
             candidate_state[
                 symbol
             ]['direction'] = (
                 'BULLISH'
             )
 
+    # ==========================================
+    # RETAIN EVERY BEARISH TOP-30 ENTRY
+    # ==========================================
     for _, candidate in (
         current_bearish_top30.iterrows()
     ):
@@ -2356,6 +2451,8 @@ def dashboard_live_loop():
 
         else:
 
+            # Same stock can move from bullish
+            # to bearish during the day.
             candidate_state[
                 symbol
             ]['direction'] = (
@@ -2366,6 +2463,9 @@ def dashboard_live_loop():
         candidate_state.keys()
     )
 
+    # ==========================================
+    # NEW ORB DATA
+    # ==========================================
     orb_data = (
         fetch_orb_data_for_symbols_cached(
             tuple(sorted(symbol_to_key.items())),
@@ -2375,6 +2475,9 @@ def dashboard_live_loop():
         )
     )
 
+    # ==========================================
+    # BUILD COMBINED RANKING
+    # ==========================================
     combined_rank_df = (
         build_combined_rank_table(
             candidate_state,
@@ -2426,8 +2529,14 @@ def dashboard_live_loop():
         )
 
         st.caption(
-            "Ranking Score = Price Rank + Volume Rank + OI Building Rank + PCR Rank + PCR OI Change Rank + ORB Score. "
-            "OI Building evaluates order flow and volume buildup. PCR and PCR OI Change gauge options/derivative sentiment and momentum."
+            "Ranking = Price Rank + Volume Rank + ORB Score. "
+            "Price: 1D/2D/5D/10D/20D high for bullish "
+            "and corresponding low for bearish. "
+            "Volume: current cumulative volume versus "
+            "previous 1D/5D/10D/20D volume. "
+            "ORB = 09:15–09:45. "
+            "ORB breakout = +3; maintained momentum = +5 total; "
+            "return inside ORB after a breakout = -3."
         )
 
 
